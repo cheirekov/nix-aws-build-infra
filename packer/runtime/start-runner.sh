@@ -24,6 +24,13 @@ repository_url="$(jq -er .repository_url <<<"${run_config}")"
 registration_token="$(jq -er .registration_token <<<"${run_config}")"
 runner_name="$(jq -er .runner_name <<<"${run_config}")"
 runner_labels="$(jq -er .runner_labels <<<"${run_config}")"
+nix_bin_dir=/nix/var/nix/profiles/default/bin
+
+if [[ ! -x "${nix_bin_dir}/nix" ]]; then
+  log "Nix executable is missing from ${nix_bin_dir}"
+  exit 1
+fi
+runner_path="${nix_bin_dir}:${PATH}"
 
 provisioner_config="$(aws ssm get-parameter \
   --region "${aws_region}" \
@@ -84,7 +91,7 @@ cp -a /opt/actions-runner-dist /opt/actions-runner
 chown -R gha-runner:gha-runner /opt/actions-runner
 
 log "registering ${runner_name} for ${repository_url}"
-runuser -u gha-runner -- /opt/actions-runner/config.sh \
+runuser -u gha-runner -- env PATH="${runner_path}" /opt/actions-runner/config.sh \
   --unattended \
   --ephemeral \
   --disableupdate \
@@ -97,7 +104,7 @@ unset registration_token
 
 log "starting one-job runner"
 set +e
-runuser -u gha-runner -- /opt/actions-runner/run.sh
+runuser -u gha-runner -- env PATH="${runner_path}" /opt/actions-runner/run.sh
 runner_status=$?
 set -e
 

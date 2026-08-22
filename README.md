@@ -13,7 +13,8 @@ time, and leaves no runner instance or EBS volume behind after a job.
 2. EC2 Fleet selects one 32-vCPU Spot instance from the configured types and
    availability zones. The runner has no inbound security-group rules.
 3. The AMI fetches its one-time configuration from encrypted SSM Parameter
-   Store, registers as an ephemeral runner, and executes exactly one job.
+   Store, exposes the pinned Nix installation to non-login Actions shells,
+   registers as an ephemeral runner, and executes exactly one job.
 4. Nix reads from CloudFront and uploads signed completed outputs directly to
    the private S3 cache. This preserves useful work if Spot is interrupted.
 5. An unconditional cleanup job removes the fleet, instance, launch template,
