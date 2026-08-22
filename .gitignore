@@ -1,0 +1,17 @@
+.direnv/
+.envrc
+.secrets/
+result
+result-*
+
+# OpenTofu
+infra/.terraform/
+infra/backend.hcl
+infra/.watchdog.zip
+infra/*.tfplan
+infra/terraform.tfstate*
+infra/crash.log
+
+# Packer
+packer/manifest.json
+packer/packer_cache/

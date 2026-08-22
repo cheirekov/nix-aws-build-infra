@@ -1,0 +1,42 @@
+name: build runner AMI
+
+on:
+  schedule:
+    - cron: "17 4 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: nix-aws-builder-ami
+  cancel-in-progress: false
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    environment: aws-build
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+      - name: Assume AMI builder role
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708
+        with:
+          aws-region: eu-central-1
+          role-to-assume: ${{ vars.NIX_AWS_IMAGE_ROLE_ARN }}
+          role-session-name: gha-image-${{ github.run_id }}
+      - name: Build and publish AMI
+        run: |
+          cd packer
+          nix develop .. --command packer init .
+          nix develop .. --command packer build .
+          artifact_id=$(jq -er '.builds[-1].artifact_id' manifest.json)
+          ami_id=${artifact_id##*:}
+          aws ssm put-parameter \
+            --region eu-central-1 \
+            --name /nix-aws-build-infra/ami/current \
+            --type String \
+            --value "$ami_id" \
+            --overwrite

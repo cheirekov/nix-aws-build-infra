@@ -1,0 +1,13 @@
+{ ... }:
+{
+  nix.settings = {
+    substituters = [
+      "https://CLOUDFRONT_DOMAIN"
+      "https://cache.nixos.org"
+    ];
+    trusted-public-keys = [
+      "nix-aws-build-infra-1:PUBLIC_KEY"
+      "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+    ];
+  };
+}

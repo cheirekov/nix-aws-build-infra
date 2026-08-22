@@ -1,0 +1,19 @@
+name: cache fixture smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    uses: cheirekov/nix-aws-build-infra/.github/workflows/nix-build.yml@main
+    with:
+      aws_role_arn: ${{ vars.NIX_AWS_ROLE_ARN }}
+      github_app_id: ${{ vars.NIX_AWS_GITHUB_APP_ID }}
+      flake_attribute: checks.x86_64-linux.fixture
+      timeout_minutes: 30
+    secrets:
+      github_app_private_key: ${{ secrets.NIX_AWS_GITHUB_APP_PRIVATE_KEY }}

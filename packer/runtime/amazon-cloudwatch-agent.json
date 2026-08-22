@@ -1,0 +1,29 @@
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "run_as_user": "root"
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/nix-aws-runner.log",
+            "log_group_name": "/__PROJECT_NAME__/runners",
+            "log_stream_name": "{instance_id}/bootstrap"
+          },
+          {
+            "file_path": "/opt/actions-runner/_diag/Runner_*.log",
+            "log_group_name": "/__PROJECT_NAME__/runners",
+            "log_stream_name": "{instance_id}/runner"
+          },
+          {
+            "file_path": "/opt/actions-runner/_diag/Worker_*.log",
+            "log_group_name": "/__PROJECT_NAME__/runners",
+            "log_stream_name": "{instance_id}/worker"
+          }
+        ]
+      }
+    }
+  }
+}

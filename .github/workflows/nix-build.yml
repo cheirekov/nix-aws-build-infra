@@ -1,0 +1,157 @@
+name: reusable Nix build on EC2 Spot
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        description: AWS region containing the builder infrastructure
+        required: false
+        type: string
+        default: eu-central-1
+      aws_role_arn:
+        description: GitHub OIDC provisioner role ARN
+        required: true
+        type: string
+      github_app_id:
+        description: GitHub App ID allowed to administer runners
+        required: true
+        type: string
+      flake_attribute:
+        description: Flake attribute to build
+        required: false
+        type: string
+        default: default
+      verification_script:
+        description: Trusted repository command run after the build
+        required: false
+        type: string
+        default: ""
+      timeout_minutes:
+        description: Build job timeout
+        required: false
+        type: number
+        default: 600
+      runner_profile:
+        description: Runner capacity profile
+        required: false
+        type: string
+        default: large-x86_64
+    secrets:
+      github_app_private_key:
+        description: Private key for the least-privilege runner GitHub App
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: nix-aws-full-build-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    if: inputs.runner_profile == 'large-x86_64'
+    runs-on: ubuntu-latest
+    environment: aws-build
+    timeout-minutes: 20
+    outputs:
+      fleet_id: ${{ steps.provision.outputs.fleet_id }}
+      instance_id: ${{ steps.provision.outputs.instance_id }}
+      launch_template_id: ${{ steps.provision.outputs.launch_template_id }}
+      runner_name: ${{ steps.provision.outputs.runner_name }}
+      runs_on: ${{ steps.provision.outputs.runs_on }}
+      ssm_parameter: ${{ steps.provision.outputs.ssm_parameter }}
+    steps:
+      - name: Check out infrastructure scripts
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: cheirekov/nix-aws-build-infra
+          ref: main
+
+      - id: app-token
+        name: Create GitHub App token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        with:
+          app-id: ${{ inputs.github_app_id }}
+          private-key: ${{ secrets.github_app_private_key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Assume AWS provisioner role
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          role-session-name: gha-provision-${{ github.run_id }}
+
+      - id: provision
+        name: Provision ephemeral runner
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+          GITHUB_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: ./scripts/provision-runner.sh
+
+  build:
+    needs: provision
+    runs-on: ${{ fromJSON(needs.provision.outputs.runs_on) }}
+    environment: aws-build
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    permissions:
+      contents: read
+    steps:
+      - name: Check out caller repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Check out build helper
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: cheirekov/nix-aws-build-infra
+          ref: main
+          path: .nix-aws-build-infra
+
+      - name: Build, verify and publish closure
+        env:
+          FLAKE_ATTRIBUTE: ${{ inputs.flake_attribute }}
+          VERIFICATION_SCRIPT: ${{ inputs.verification_script }}
+        run: ./.nix-aws-build-infra/scripts/build-flake.sh
+
+  cleanup:
+    if: always() && needs.provision.result != 'skipped'
+    needs: [provision, build]
+    runs-on: ubuntu-latest
+    environment: aws-build
+    timeout-minutes: 20
+    steps:
+      - name: Check out infrastructure scripts
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: cheirekov/nix-aws-build-infra
+          ref: main
+
+      - id: app-token
+        name: Create GitHub App token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        with:
+          app-id: ${{ inputs.github_app_id }}
+          private-key: ${{ secrets.github_app_private_key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Assume AWS provisioner role
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          role-session-name: gha-cleanup-${{ github.run_id }}
+
+      - name: Remove ephemeral resources
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+          FLEET_ID: ${{ needs.provision.outputs.fleet_id }}
+          GITHUB_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          INSTANCE_ID: ${{ needs.provision.outputs.instance_id }}
+          LAUNCH_TEMPLATE_ID: ${{ needs.provision.outputs.launch_template_id }}
+          RUNNER_NAME: ${{ needs.provision.outputs.runner_name }}
+          SSM_PARAMETER: ${{ needs.provision.outputs.ssm_parameter }}
+        run: ./scripts/cleanup-runner.sh

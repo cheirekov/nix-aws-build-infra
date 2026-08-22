@@ -1,0 +1,14 @@
+[Unit]
+Description=One-job GitHub Actions Nix runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/nix-aws-build-infra/bin/start-runner.sh
+TimeoutStartSec=12h
+TimeoutStopSec=5min
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
