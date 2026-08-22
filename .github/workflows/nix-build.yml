@@ -91,6 +91,11 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Validate runner Nix toolchain
+        run: |
+          command -v nix
+          nix --version
+
       - name: Check out caller repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
 
