@@ -15,18 +15,24 @@ variable "github_owner" {
   default = "cheirekov"
 }
 
+variable "github_owner_id" {
+  description = "Immutable GitHub owner ID used in the default OIDC subject for new repositories."
+  type        = number
+  default     = 16937955
+}
+
 variable "github_environment" {
   type    = string
   default = "aws-build"
 }
 
 variable "allowed_repositories" {
-  description = "Repositories allowed to assume the provisioning role."
-  type        = set(string)
-  default = [
-    "brave_browser_nix",
-    "nix-aws-build-infra",
-  ]
+  description = "Repository names and immutable IDs allowed to assume the provisioning role."
+  type        = map(number)
+  default = {
+    brave_browser_nix   = 1340587597
+    nix-aws-build-infra = 1342757814
+  }
 }
 
 variable "cache_key_name" {

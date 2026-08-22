@@ -35,8 +35,8 @@ data "aws_iam_policy_document" "github_assume" {
       test     = "ForAnyValue:StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
       values = [
-        for repository in var.allowed_repositories :
-        "repo:${var.github_owner}/${repository}:environment:${var.github_environment}"
+        for repository, repository_id in var.allowed_repositories :
+        "repo:${var.github_owner}@${var.github_owner_id}/${repository}@${repository_id}:environment:${var.github_environment}"
       ]
     }
   }
@@ -212,7 +212,7 @@ data "aws_iam_policy_document" "github_image_assume" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_owner}/nix-aws-build-infra:environment:${var.github_environment}"]
+      values   = ["repo:${var.github_owner}@${var.github_owner_id}/nix-aws-build-infra@${var.allowed_repositories["nix-aws-build-infra"]}:environment:${var.github_environment}"]
     }
   }
 }

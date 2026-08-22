@@ -34,10 +34,12 @@ if [[ "${wildcard_resources}" -ne 4 ]]; then
   exit 1
 fi
 
-# OIDC is audience-bound and only environment-scoped allowlisted repositories
-# can assume the provisioning role. The only PassRole target is the runner.
+# OIDC is audience-bound and only environment-scoped allowlisted repositories,
+# identified by immutable owner and repository IDs, can assume the provisioning
+# role. The only PassRole target is the runner.
 require_pattern 'variable = "token.actions.githubusercontent.com:aud"[[:space:]]+values[[:space:]]+= \["sts.amazonaws.com"\]' "${iam_file}"
-require_pattern 'repo:\$\{var.github_owner\}/\$\{repository\}:environment:\$\{var.github_environment\}' "${iam_file}"
+require_pattern 'repo:\$\{var.github_owner\}@\$\{var.github_owner_id\}/\$\{repository\}@\$\{repository_id\}:environment:\$\{var.github_environment\}' "${iam_file}"
+require_pattern 'nix-aws-build-infra@\$\{var.allowed_repositories\["nix-aws-build-infra"\]\}:environment:\$\{var.github_environment\}' "${iam_file}"
 require_pattern 'actions[[:space:]]+= \["iam:PassRole"\][[:space:]]+resources = \[aws_iam_role.runner.arn\]' "${iam_file}"
 
 # The runner can read only its project secret/parameters and write only the

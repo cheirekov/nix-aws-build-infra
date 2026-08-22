@@ -47,7 +47,13 @@ repositories, and grant repository **Administration: read and write** plus
 In this infrastructure repository, also set `NIX_AWS_IMAGE_ROLE_ARN` from
 `tofu output github_image_builder_role_arn`. Disable GitHub App webhooks; no
 callback URL is required. Generate and download one App private key, store it
-only as the environment secret above, then delete the downloaded copy.
+only as the repository secret above, then delete the downloaded copy.
+
+The OpenTofu defaults bind AWS OIDC trust to the immutable GitHub owner and
+repository IDs as well as the protected `aws-build` environment. Update
+`github_owner_id` and the `allowed_repositories` name-to-ID map if the owner or
+allowlist changes; repository names alone do not match the default OIDC subject
+used by newly created repositories.
 
 The signing private key is generated under ignored `.secrets/`, uploaded to
 AWS, and deleted locally after a successful deployment. It is never placed in
