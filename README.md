@@ -42,7 +42,7 @@ repositories, and grant repository **Administration: read and write** plus
 - environment `aws-build`, restricted to the `main` branch;
 - variable `NIX_AWS_ROLE_ARN` from `tofu output github_provisioner_role_arn`;
 - variable `NIX_AWS_GITHUB_APP_ID`;
-- secret `NIX_AWS_GITHUB_APP_PRIVATE_KEY`.
+- repository Actions secret `NIX_AWS_GITHUB_APP_PRIVATE_KEY`.
 
 In this infrastructure repository, also set `NIX_AWS_IMAGE_ROLE_ARN` from
 `tofu output github_image_builder_role_arn`. Disable GitHub App webhooks; no
@@ -67,11 +67,16 @@ jobs:
     with:
       flake_attribute: br
       verification_script: ./scripts/verify.sh ./result
+    secrets:
+      github_app_private_key: ${{ secrets.NIX_AWS_GITHUB_APP_PRIVATE_KEY }}
 ```
 
-The reusable workflow resolves `NIX_AWS_ROLE_ARN`,
-`NIX_AWS_GITHUB_APP_ID`, and `NIX_AWS_GITHUB_APP_PRIVATE_KEY` from the caller
-repository's protected `aws-build` environment inside each privileged job.
+The reusable workflow resolves `NIX_AWS_ROLE_ARN` and
+`NIX_AWS_GITHUB_APP_ID` from the caller repository's protected `aws-build`
+environment. GitHub does not expose environment secrets across
+`workflow_call`, so the narrowly scoped App key is a repository secret passed
+explicitly through the declared `github_app_private_key` interface. Fork pull
+requests cannot access repository Actions secrets.
 
 Do not invoke the workflow for untrusted pull-request code. The runner's
 instance role can write to the cache and read its signing key by design.
