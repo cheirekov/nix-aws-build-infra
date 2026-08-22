@@ -70,7 +70,7 @@ jobs:
           repositories: ${{ github.event.repository.name }}
 
       - name: Assume AWS provisioner role
-        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
         with:
           aws-region: ${{ inputs.aws_region }}
           role-to-assume: ${{ vars.NIX_AWS_ROLE_ARN }}
@@ -135,7 +135,7 @@ jobs:
           repositories: ${{ github.event.repository.name }}
 
       - name: Assume AWS provisioner role
-        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
         with:
           aws-region: ${{ inputs.aws_region }}
           role-to-assume: ${{ vars.NIX_AWS_ROLE_ARN }}
