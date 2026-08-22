@@ -8,14 +8,6 @@ on:
         required: false
         type: string
         default: eu-central-1
-      aws_role_arn:
-        description: GitHub OIDC provisioner role ARN
-        required: true
-        type: string
-      github_app_id:
-        description: GitHub App ID allowed to administer runners
-        required: true
-        type: string
       flake_attribute:
         description: Flake attribute to build
         required: false
@@ -36,11 +28,6 @@ on:
         required: false
         type: string
         default: large-x86_64
-    secrets:
-      github_app_private_key:
-        description: Private key for the least-privilege runner GitHub App
-        required: true
-
 permissions:
   contents: read
   id-token: write
@@ -71,10 +58,10 @@ jobs:
 
       - id: app-token
         name: Create GitHub App token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
         with:
-          app-id: ${{ inputs.github_app_id }}
-          private-key: ${{ secrets.github_app_private_key }}
+          app-id: ${{ vars.NIX_AWS_GITHUB_APP_ID }}
+          private-key: ${{ secrets.NIX_AWS_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
 
@@ -82,7 +69,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708
         with:
           aws-region: ${{ inputs.aws_region }}
-          role-to-assume: ${{ inputs.aws_role_arn }}
+          role-to-assume: ${{ vars.NIX_AWS_ROLE_ARN }}
           role-session-name: gha-provision-${{ github.run_id }}
 
       - id: provision
@@ -131,10 +118,10 @@ jobs:
 
       - id: app-token
         name: Create GitHub App token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
         with:
-          app-id: ${{ inputs.github_app_id }}
-          private-key: ${{ secrets.github_app_private_key }}
+          app-id: ${{ vars.NIX_AWS_GITHUB_APP_ID }}
+          private-key: ${{ secrets.NIX_AWS_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
 
@@ -142,7 +129,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708
         with:
           aws-region: ${{ inputs.aws_region }}
-          role-to-assume: ${{ inputs.aws_role_arn }}
+          role-to-assume: ${{ vars.NIX_AWS_ROLE_ARN }}
           role-session-name: gha-cleanup-${{ github.run_id }}
 
       - name: Remove ephemeral resources

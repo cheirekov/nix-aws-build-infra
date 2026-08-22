@@ -65,13 +65,13 @@ jobs:
       contents: read
       id-token: write
     with:
-      aws_role_arn: ${{ vars.NIX_AWS_ROLE_ARN }}
-      github_app_id: ${{ vars.NIX_AWS_GITHUB_APP_ID }}
       flake_attribute: br
       verification_script: ./scripts/verify.sh ./result
-    secrets:
-      github_app_private_key: ${{ secrets.NIX_AWS_GITHUB_APP_PRIVATE_KEY }}
 ```
+
+The reusable workflow resolves `NIX_AWS_ROLE_ARN`,
+`NIX_AWS_GITHUB_APP_ID`, and `NIX_AWS_GITHUB_APP_PRIVATE_KEY` from the caller
+repository's protected `aws-build` environment inside each privileged job.
 
 Do not invoke the workflow for untrusted pull-request code. The runner's
 instance role can write to the cache and read its signing key by design.
