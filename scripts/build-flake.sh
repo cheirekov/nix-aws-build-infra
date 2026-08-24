@@ -35,8 +35,16 @@ if [[ -n "${verification_script}" ]]; then
   bash -euo pipefail -c "${verification_script}"
 fi
 
-printf '[build] uploading final closure to %s\n' "${NIX_CACHE_BUCKET}"
-nix copy -L --to "${NIX_CACHE_STORE_URL}" "${result_path}"
-nix path-info --store "${NIX_CACHE_URL}" "${result_path}"
+mapfile -t built_paths < <(sort -u "${NIX_AWS_BUILT_PATHS_FILE}")
+if ((${#built_paths[@]})); then
+  printf '[build] retrying %d locally built output(s) to %s\n' \
+    "${#built_paths[@]}" "${NIX_CACHE_BUCKET}"
+  nix copy -L --no-recursive --to "${NIX_CACHE_STORE_URL}" "${built_paths[@]}"
+  for output_path in "${built_paths[@]}"; do
+    nix path-info --store "${NIX_CACHE_URL}" "${output_path}"
+  done
+else
+  printf '[build] all paths were substituted; no outputs need publishing\n'
+fi
 
 printf 'BUILD_RESULT=%s\nCACHE_PUSH=ok\n' "${result_path}"

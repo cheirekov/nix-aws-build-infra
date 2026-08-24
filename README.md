@@ -91,8 +91,14 @@ Install from your own pinned fork or use its development shell:
 nix profile install github:OWNER/nix-aws-build-infra/FULL_COMMIT_SHA
 nix-aws build .#package
 nix-aws build --push .#package
+nix-aws cache push --closure ./result
 nix-aws build --remote --system aarch64-linux --profile standard .#package
 ```
+
+`build --push` publishes only outputs built by that invocation. Use `cache push
+--closure` only when an intentionally self-contained copy of an existing result
+is required; normal deployments use the project cache together with their
+configured upstream substituters.
 
 Configure the public cache by rendering the generated client fragment after
 deployment:

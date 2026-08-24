@@ -26,6 +26,7 @@ DEFAULT_PROJECT = "nix-aws-build-infra"
 DEFAULT_PROFILE = "nix-aws-build"
 DEFAULT_BUDGET = 25.0
 ROLE_RE = re.compile(r":assumed-role/AWSReservedSSO_NixAwsBuildOperator_[^/]+/")
+BUILD_ACTIVITY_TYPE = 105
 
 
 @dataclass(frozen=True)
@@ -131,6 +132,7 @@ class App:
             directory.mkdir(parents=True, exist_ok=True, mode=mode)
             directory.chmod(mode)
         self.state_file = self.runtime_dir / "session.json"
+        self.last_build_log: pathlib.Path | None = None
 
     def aws(
         self,
@@ -236,6 +238,7 @@ class App:
         env: dict[str, str] | None = None,
     ) -> int:
         raw_path = self.new_log("build", "jsonl")
+        self.last_build_log = raw_path
         print(f"[nix-aws] raw Nix log: {raw_path}", file=sys.stderr)
         nix_command = [
             "nix",
@@ -272,6 +275,53 @@ class App:
         nom_status = nom_process.wait()
         return nix_status if nix_status != 0 else nom_status
 
+    @staticmethod
+    def built_derivations_from_log(raw_path: pathlib.Path) -> list[str]:
+        derivations: set[str] = set()
+        for line in raw_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.startswith("@nix "):
+                continue
+            try:
+                event = json.loads(line.removeprefix("@nix "))
+            except json.JSONDecodeError:
+                continue
+            fields = event.get("fields", [])
+            if (
+                event.get("action") == "start"
+                and event.get("type") == BUILD_ACTIVITY_TYPE
+                and fields
+                and isinstance(fields[0], str)
+                and fields[0].startswith("/nix/store/")
+                and fields[0].endswith(".drv")
+            ):
+                derivations.add(fields[0])
+        return sorted(derivations)
+
+    def locally_built_outputs(self) -> list[str]:
+        if self.last_build_log is None:
+            raise NixAwsError("the local build log is unavailable")
+        derivations = self.built_derivations_from_log(self.last_build_log)
+        if not derivations:
+            return []
+        result = subprocess.run(
+            ["nix-store", "--query", "--outputs", *derivations],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        outputs = sorted(
+            {
+                line
+                for line in result.stdout.splitlines()
+                if line.startswith("/nix/store/")
+            }
+        )
+        manifest = self.last_build_log.with_suffix(".built-paths")
+        manifest.write_text("".join(f"{path}\n" for path in outputs), encoding="utf-8")
+        manifest.chmod(0o600)
+        print(f"[nix-aws] locally built output manifest: {manifest}", file=sys.stderr)
+        return outputs
+
     def resolve_store_paths(self, targets: Iterable[str]) -> list[str]:
         resolved: list[str] = []
         installables: list[str] = []
@@ -296,7 +346,7 @@ class App:
             raise NixAwsError("no Nix store paths were resolved")
         return sorted(set(resolved))
 
-    def cache_push(self, targets: Iterable[str]) -> None:
+    def cache_push(self, targets: Iterable[str], *, closure: bool = False) -> None:
         self.require_operator_identity()
         config = self.provisioner_config()
         secret_arn = config.get("local_cache_signing_secret_arn")
@@ -327,7 +377,11 @@ class App:
                 f"&parallel-compression=true&write-nar-listing=true"
                 f"&secret-key={urllib.parse.quote(str(key_path), safe='/')}"
             )
-            status = self.run_logged(["nix", "copy", "-L", "--to", store_url, *paths], "cache-push")
+            command = ["nix", "copy", "-L"]
+            if not closure:
+                command.append("--no-recursive")
+            command.extend(["--to", store_url, *paths])
+            status = self.run_logged(command, "cache-push")
             if status:
                 raise NixAwsError(f"nix copy failed with status {status}")
             for path in paths:
@@ -959,6 +1013,11 @@ def parser() -> argparse.ArgumentParser:
     cache = commands.add_parser("cache")
     cache_commands = cache.add_subparsers(dest="cache_command", required=True)
     push = cache_commands.add_parser("push")
+    push.add_argument(
+        "--closure",
+        action="store_true",
+        help="publish each target and its full dependency closure",
+    )
     push.add_argument("targets", nargs="+")
 
     logs = commands.add_parser("logs")
@@ -1008,7 +1067,11 @@ def run(args: argparse.Namespace) -> int:
             return status
         status = app.run_monitored_build(args.installable, args.nix_args)
         if status == 0 and args.push:
-            app.cache_push(["result"])
+            outputs = app.locally_built_outputs()
+            if outputs:
+                app.cache_push(outputs)
+            else:
+                print("[nix-aws] no local build outputs; nothing to publish")
         return status
     if args.command == "session":
         if args.session_command == "start":
@@ -1029,7 +1092,7 @@ def run(args: argparse.Namespace) -> int:
             raise NixAwsError("session exec requires a command after --")
         return app.session_exec(command)
     if args.command == "cache":
-        app.cache_push(args.targets)
+        app.cache_push(args.targets, closure=args.closure)
         return 0
     if args.command == "logs":
         if args.logs_command == "list":

@@ -21,14 +21,20 @@ CloudFront substituter and public keys are configured in Nix.
 nix-aws build .#package
 nix-aws build --push .#package
 nix-aws cache push ./result
+nix-aws cache push --closure ./result
 ```
 
-The first command only reads the public CloudFront cache. `--push` is explicit
-and obtains the isolated `nix-aws-local-1` signing key in a mode-0600 runtime
-file, uploads the closure, verifies it through CloudFront, and removes the key.
+The first command only reads the public CloudFront cache. `build --push` is
+explicit and publishes only outputs built by that invocation; upstream
+dependencies remain in their existing substituters. It obtains the isolated
+`nix-aws-local-1` signing key in a mode-0600 runtime file, verifies every
+published output through CloudFront, and removes the key. `cache push` publishes
+only the explicitly named paths. Add `--closure` only when a full standalone
+mirror of a result and all of its dependencies is required.
 Remote builders started by `nix-aws` use the same isolated local signing
 identity inside a dedicated EC2 role and publish automatically. GitHub runners
-alone use the separate CI signing identity.
+alone use the separate CI signing identity. Their post-build hooks publish only
+locally built outputs and retry those outputs at the end of a successful job.
 
 ## One-shot remote build
 

@@ -78,6 +78,9 @@ chown root:gha-runner "${signing_key_file}"
 chmod 0640 "${signing_key_file}"
 
 cache_store_url="s3://${cache_bucket}?region=${aws_region}&compression=zstd&parallel-compression=true&write-nar-listing=true&secret-key=${signing_key_file}"
+build_manifest_file=/run/nix-aws-build-infra/built-paths
+install -d -m 0755 /run/nix-aws-build-infra
+install -m 0644 /dev/null "${build_manifest_file}"
 trusted_cache_keys="${cache_public_key}"
 if [[ "${cache_local_public_key}" == *:* ]]; then
   trusted_cache_keys+=" ${cache_local_public_key}"
@@ -90,6 +93,7 @@ install -m 0644 /dev/null /etc/nix-aws-runner/cache.env
   printf 'NIX_CACHE_PUBLIC_KEY=%q\n' "${cache_public_key}"
   printf 'NIX_CACHE_SIGNING_KEY_FILE=%q\n' "${signing_key_file}"
   printf 'NIX_CACHE_STORE_URL=%q\n' "${cache_store_url}"
+  printf 'NIX_AWS_BUILT_PATHS_FILE=%q\n' "${build_manifest_file}"
 } >/etc/nix-aws-runner/cache.env
 
 cat >>/etc/nix/nix.conf <<EOF
