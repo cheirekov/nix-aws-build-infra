@@ -78,6 +78,7 @@
               opentofu
               packer
               python3Packages.pytest
+              ripgrep
               ruff
               shellcheck
               shfmt
