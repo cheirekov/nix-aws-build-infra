@@ -511,6 +511,82 @@ class App:
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
 
+    def create_spot_fleet(self, fleet_config: dict[str, Any]) -> tuple[str, str]:
+        """Launch one instance, excluding capacity-starved pools between attempts.
+
+        An instant EC2 Fleet evaluates every supplied override, but makes only one
+        synchronous launch attempt.  A subsequent request is therefore required
+        after InsufficientInstanceCapacity.  Keep the recommended allocation
+        strategy for every request and remove only the pool AWS just rejected.
+        """
+        remaining = list(fleet_config["LaunchTemplateConfigs"][0]["Overrides"])
+        capacity_failures: list[str] = []
+        while remaining:
+            request = json.loads(json.dumps(fleet_config))
+            request["LaunchTemplateConfigs"][0]["Overrides"] = remaining
+            fleet = self.aws_json(
+                "ec2",
+                "create-fleet",
+                "--cli-input-json",
+                json.dumps(request, separators=(",", ":")),
+            )
+            fleet_id = str(fleet.get("FleetId", ""))
+            instances = [
+                instance_id
+                for group in fleet.get("Instances", [])
+                for instance_id in group.get("InstanceIds", [])
+            ]
+            if instances:
+                return fleet_id, str(instances[0])
+
+            if fleet_id:
+                self.aws(
+                    "ec2",
+                    "delete-fleets",
+                    "--fleet-ids",
+                    fleet_id,
+                    "--terminate-instances",
+                    check=False,
+                )
+            errors = fleet.get("Errors", [])
+            if not errors or any(
+                error.get("ErrorCode") != "InsufficientInstanceCapacity" for error in errors
+            ):
+                raise NixAwsError(f"EC2 Fleet failed: {json.dumps(errors)}")
+
+            rejected = {
+                (
+                    error.get("LaunchTemplateAndOverrides", {})
+                    .get("Overrides", {})
+                    .get("SubnetId"),
+                    error.get("LaunchTemplateAndOverrides", {})
+                    .get("Overrides", {})
+                    .get("InstanceType"),
+                )
+                for error in errors
+            }
+            next_remaining = [
+                override
+                for override in remaining
+                if (override.get("SubnetId"), override.get("InstanceType")) not in rejected
+            ]
+            if len(next_remaining) == len(remaining):
+                raise NixAwsError(f"EC2 Fleet failed: {json.dumps(errors)}")
+            capacity_failures.extend(
+                f"{instance_type}@{subnet}"
+                for subnet, instance_type in rejected
+                if subnet and instance_type
+            )
+            remaining = next_remaining
+            print(
+                "[nix-aws] Spot capacity unavailable in "
+                f"{', '.join(capacity_failures)}; retrying across "
+                f"{len(remaining)} remaining pools",
+                file=sys.stderr,
+            )
+
+        raise NixAwsError("EC2 Fleet exhausted every configured Spot capacity pool")
+
     def session_start(
         self,
         system: str,
@@ -658,17 +734,7 @@ class App:
                     }
                 ],
             }
-            fleet = self.aws_json(
-                "ec2",
-                "create-fleet",
-                "--cli-input-json",
-                json.dumps(fleet_config, separators=(",", ":")),
-            )
-            fleet_id = fleet["FleetId"]
-            errors = fleet.get("Errors", [])
-            if errors:
-                raise NixAwsError(f"EC2 Fleet failed: {json.dumps(errors)}")
-            instance_id = fleet["Instances"][0]["InstanceIds"][0]
+            fleet_id, instance_id = self.create_spot_fleet(fleet_config)
             self.aws("ec2", "wait", "instance-running", "--instance-ids", instance_id)
             deadline = time.monotonic() + 900
             ready: dict[str, Any] | None = None
@@ -794,7 +860,7 @@ class App:
 
     def session_exec(
         self,
-        command: Sequence[str],
+        command: Sequence[str] = (),
         *,
         monitored_build: str | None = None,
         extra_args: Sequence[str] = (),

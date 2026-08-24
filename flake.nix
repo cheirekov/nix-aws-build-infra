@@ -59,6 +59,7 @@
                   pkgs.ssm-session-manager-plugin
                 ]}
             '';
+            meta.mainProgram = "nix-aws";
           };
         in {
           inherit nix-aws;

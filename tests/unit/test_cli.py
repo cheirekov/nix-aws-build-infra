@@ -61,9 +61,7 @@ def test_state_round_trip(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatc
     assert json.loads(app.state_file.read_text())["session_id"] == "abc"
 
 
-def test_log_files_are_private(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_log_files_are_private(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     app = App(argparse.Namespace())
@@ -135,6 +133,75 @@ def test_cleanup_targets_only_session_resources(
     ]
 
 
+def test_spot_fleet_retries_without_rejected_capacity_pool(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    app = App(argparse.Namespace())
+    requests: list[dict[str, object]] = []
+    responses = iter(
+        [
+            {
+                "FleetId": "fleet-failed",
+                "Errors": [
+                    {
+                        "ErrorCode": "InsufficientInstanceCapacity",
+                        "LaunchTemplateAndOverrides": {
+                            "Overrides": {
+                                "SubnetId": "subnet-a",
+                                "InstanceType": "c7i.4xlarge",
+                            }
+                        },
+                    }
+                ],
+                "Instances": [],
+            },
+            {
+                "FleetId": "fleet-ready",
+                "Errors": [],
+                "Instances": [{"InstanceIds": ["i-ready"]}],
+            },
+        ]
+    )
+
+    def fake_aws_json(*arguments: str) -> dict[str, object]:
+        requests.append(json.loads(arguments[-1]))
+        return next(responses)
+
+    cleanup_calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(app, "aws_json", fake_aws_json)
+    monkeypatch.setattr(
+        app,
+        "aws",
+        lambda *arguments, **_kwargs: cleanup_calls.append(arguments),
+    )
+    config = {
+        "LaunchTemplateConfigs": [
+            {
+                "Overrides": [
+                    {"SubnetId": "subnet-a", "InstanceType": "c7i.4xlarge"},
+                    {"SubnetId": "subnet-b", "InstanceType": "m7i.4xlarge"},
+                ]
+            }
+        ]
+    }
+
+    assert app.create_spot_fleet(config) == ("fleet-ready", "i-ready")
+    assert requests[1]["LaunchTemplateConfigs"][0]["Overrides"] == [
+        {"SubnetId": "subnet-b", "InstanceType": "m7i.4xlarge"}
+    ]
+    assert cleanup_calls == [
+        (
+            "ec2",
+            "delete-fleets",
+            "--fleet-ids",
+            "fleet-failed",
+            "--terminate-instances",
+        )
+    ]
+
+
 def test_local_build_without_push_never_publishes(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -158,3 +225,44 @@ def test_remote_and_push_are_mutually_exclusive(
 
     with pytest.raises(NixAwsError, match="remote builders publish automatically"):
         run(args)
+
+
+def test_remote_build_uses_one_shot_session_and_always_stops(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    calls: list[tuple[object, ...]] = []
+
+    monkeypatch.setattr(
+        App,
+        "session_start",
+        lambda _self, system, profile, override: calls.append(("start", system, profile, override)),
+    )
+
+    def fake_exec(
+        _self: App,
+        command: tuple[str, ...] = (),
+        *,
+        monitored_build: str | None = None,
+        extra_args: tuple[str, ...] = (),
+    ) -> int:
+        calls.append(("exec", command, monitored_build, extra_args))
+        return 0
+
+    monkeypatch.setattr(App, "session_exec", fake_exec)
+    monkeypatch.setattr(
+        App,
+        "session_stop",
+        lambda _self, *, quiet=False: calls.append(("stop", quiet)),
+    )
+    args = parser().parse_args(
+        ["build", "--remote", "--system", "x86_64-linux", "--profile", "standard", ".#fixture"]
+    )
+
+    assert run(args) == 0
+    assert calls == [
+        ("start", "x86_64-linux", "standard", False),
+        ("exec", (), ".#fixture", []),
+        ("stop", True),
+    ]
