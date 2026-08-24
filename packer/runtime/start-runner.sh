@@ -20,10 +20,7 @@ run_config="$(aws ssm get-parameter \
   --query Parameter.Value \
   --output text)"
 
-repository_url="$(jq -er .repository_url <<<"${run_config}")"
-registration_token="$(jq -er .registration_token <<<"${run_config}")"
-runner_name="$(jq -er .runner_name <<<"${run_config}")"
-runner_labels="$(jq -er .runner_labels <<<"${run_config}")"
+run_mode="$(jq -r '.mode // "github-runner"' <<<"${run_config}")"
 nix_bin_dir=/nix/var/nix/profiles/default/bin
 
 if [[ ! -x "${nix_bin_dir}/nix" ]]; then
@@ -42,10 +39,19 @@ cache_public_key="$(aws ssm get-parameter \
   --name "/${project_name}/config/cache-public-key" \
   --query Parameter.Value \
   --output text)"
+cache_local_public_key="$(aws ssm get-parameter \
+  --region "${aws_region}" \
+  --name "/${project_name}/config/cache-local-public-key" \
+  --query Parameter.Value \
+  --output text)"
 
 cache_bucket="$(jq -er .cache_bucket <<<"${provisioner_config}")"
 cache_url="$(jq -er .cache_url <<<"${provisioner_config}")"
-signing_secret="$(jq -er .cache_signing_secret_arn <<<"${provisioner_config}")"
+if [[ "${run_mode}" == "remote-builder" ]]; then
+  signing_secret="$(jq -er .local_cache_signing_secret_arn <<<"${provisioner_config}")"
+else
+  signing_secret="$(jq -er .cache_signing_secret_arn <<<"${provisioner_config}")"
+fi
 signing_key_file=/run/nix-cache-signing-key
 
 aws secretsmanager get-secret-value \
@@ -57,6 +63,10 @@ chown root:gha-runner "${signing_key_file}"
 chmod 0640 "${signing_key_file}"
 
 cache_store_url="s3://${cache_bucket}?region=${aws_region}&compression=zstd&parallel-compression=true&write-nar-listing=true&secret-key=${signing_key_file}"
+trusted_cache_keys="${cache_public_key}"
+if [[ "${cache_local_public_key}" == *:* ]]; then
+  trusted_cache_keys+=" ${cache_local_public_key}"
+fi
 install -m 0644 /dev/null /etc/nix-aws-runner/cache.env
 {
   printf 'AWS_REGION=%q\n' "${aws_region}"
@@ -69,7 +79,7 @@ install -m 0644 /dev/null /etc/nix-aws-runner/cache.env
 
 cat >>/etc/nix/nix.conf <<EOF
 substituters = ${cache_url} https://cache.nixos.org
-trusted-public-keys = ${cache_public_key} cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+trusted-public-keys = ${trusted_cache_keys} cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
 post-build-hook = /opt/nix-aws-build-infra/bin/post-build-hook.sh
 narinfo-cache-negative-ttl = 0
 EOF
@@ -80,6 +90,60 @@ systemctl restart nix-daemon.service
   -m ec2 \
   -s \
   -c file:/etc/nix-aws-runner/amazon-cloudwatch-agent.json
+
+if [[ "${run_mode}" == "remote-builder" ]]; then
+  session_id="$(jq -er .session_id <<<"${run_config}")"
+  authorized_key="$(jq -er .authorized_key <<<"${run_config}")"
+  expires_at="$(jq -er .expires_at <<<"${run_config}")"
+  ready_parameter="/${project_name}/sessions/${session_id}/ready"
+
+  install -d -m 0700 -o nixremote -g nixremote /home/nixremote/.ssh
+  printf '%s\n' "${authorized_key}" >/home/nixremote/.ssh/authorized_keys
+  chown nixremote:nixremote /home/nixremote/.ssh/authorized_keys
+  chmod 0600 /home/nixremote/.ssh/authorized_keys
+  ssh-keygen -A
+  install -d -m 0755 /etc/ssh/sshd_config.d
+  cat >/etc/ssh/sshd_config.d/90-nix-aws-remote-builder.conf <<'EOF'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+PubkeyAuthentication yes
+AllowUsers nixremote
+EOF
+  systemctl enable --now ssh.service
+
+  host_key="$(base64 -w0 /etc/ssh/ssh_host_ed25519_key.pub)"
+  ready_value="$(jq -cn \
+    --arg host_key "${host_key}" \
+    --arg session_id "${session_id}" \
+    --arg system "$(uname -m)" \
+    '{host_key:$host_key,session_id:$session_id,machine:$system}')"
+  aws ssm put-parameter \
+    --region "${aws_region}" \
+    --name "${ready_parameter}" \
+    --type String \
+    --value "${ready_value}" \
+    --overwrite >/dev/null
+  unset authorized_key ready_value run_config
+
+  log "remote builder ${session_id} is ready"
+  while (("$(date +%s)" < expires_at)); do
+    sleep 60
+  done
+  log "remote builder ${session_id} reached its TTL; shutting down"
+  shutdown -h now
+  exit 0
+fi
+
+if [[ "${run_mode}" != "github-runner" ]]; then
+  log "unsupported runtime mode ${run_mode}"
+  exit 2
+fi
+
+repository_url="$(jq -er .repository_url <<<"${run_config}")"
+registration_token="$(jq -er .registration_token <<<"${run_config}")"
+runner_name="$(jq -er .runner_name <<<"${run_config}")"
+runner_labels="$(jq -er .runner_labels <<<"${run_config}")"
 
 # The registration token is useful once; remove its encrypted parameter before
 # any repository code starts executing.

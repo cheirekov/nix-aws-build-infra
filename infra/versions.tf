@@ -17,7 +17,6 @@ terraform {
   }
 
   backend "s3" {
-    key          = "nix-aws-build-infra/terraform.tfstate"
     encrypt      = true
     use_lockfile = true
   }

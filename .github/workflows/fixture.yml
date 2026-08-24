@@ -2,6 +2,17 @@ name: cache fixture smoke test
 
 on:
   workflow_dispatch:
+    inputs:
+      runner_profile:
+        description: Native fixture architecture and capacity
+        required: true
+        type: choice
+        default: standard-x86_64
+        options:
+          - standard-x86_64
+          - large-x86_64
+          - standard-aarch64
+          - large-aarch64
 
 permissions:
   contents: read
@@ -9,9 +20,13 @@ permissions:
 
 jobs:
   build:
-    uses: cheirekov/nix-aws-build-infra/.github/workflows/nix-build.yml@main
+    uses: ./.github/workflows/nix-build.yml
     with:
-      flake_attribute: checks.x86_64-linux.fixture
+      aws_region: ${{ vars.NIX_AWS_REGION || 'eu-central-1' }}
+      flake_attribute: ${{ contains(inputs.runner_profile, 'aarch64') && 'checks.aarch64-linux.fixture' || 'checks.x86_64-linux.fixture' }}
+      github_environment: ${{ vars.NIX_AWS_GITHUB_ENVIRONMENT || 'aws-build' }}
+      project_name: ${{ vars.NIX_AWS_PROJECT || 'nix-aws-build-infra' }}
+      runner_profile: ${{ inputs.runner_profile }}
       timeout_minutes: 30
     secrets:
       github_app_private_key: ${{ secrets.NIX_AWS_GITHUB_APP_PRIVATE_KEY }}

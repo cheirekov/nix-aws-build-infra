@@ -15,8 +15,16 @@ concurrency:
 
 jobs:
   image:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            packer_source: x86_64-linux.amazon-ebs.runner_x86_64
+          - system: aarch64-linux
+            packer_source: aarch64-linux.amazon-ebs.runner_aarch64
     runs-on: ubuntu-latest
-    environment: aws-build
+    environment: ${{ vars.NIX_AWS_GITHUB_ENVIRONMENT || 'aws-build' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
@@ -24,19 +32,26 @@ jobs:
       - name: Assume AMI builder role
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
         with:
-          aws-region: eu-central-1
+          aws-region: ${{ vars.NIX_AWS_REGION || 'eu-central-1' }}
           role-to-assume: ${{ vars.NIX_AWS_IMAGE_ROLE_ARN }}
-          role-session-name: gha-image-${{ github.run_id }}
+          role-session-name: gha-image-${{ github.run_id }}-${{ matrix.system }}
       - name: Build and publish AMI
+        env:
+          AWS_REGION: ${{ vars.NIX_AWS_REGION || 'eu-central-1' }}
+          PROJECT_NAME: ${{ vars.NIX_AWS_PROJECT || 'nix-aws-build-infra' }}
         run: |
           cd packer
           nix develop .. --command packer init .
-          nix develop .. --command packer build .
+          nix develop .. --command packer build \
+            -only=${{ matrix.packer_source }} \
+            -var "aws_region=${AWS_REGION}" \
+            -var "project_name=${PROJECT_NAME}" \
+            .
           artifact_id=$(jq -er '.builds[-1].artifact_id' manifest.json)
           ami_id=${artifact_id##*:}
           aws ssm put-parameter \
-            --region eu-central-1 \
-            --name /nix-aws-build-infra/ami/current \
+            --region "${AWS_REGION}" \
+            --name "/${PROJECT_NAME}/ami/${{ matrix.system }}" \
             --type String \
             --value "$ami_id" \
             --overwrite

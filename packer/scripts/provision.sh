@@ -3,11 +3,28 @@ set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update
-sudo apt-get install -y ca-certificates curl git jq unzip xz-utils zstd
+sudo apt-get install -y ca-certificates curl git jq openssh-server unzip xz-utils zstd
+
+case "${BUILD_ARCH:?BUILD_ARCH is required}" in
+  x86_64)
+    aws_arch=x86_64
+    deb_arch=amd64
+    cloudwatch_arch=amd64
+    ;;
+  aarch64)
+    aws_arch=aarch64
+    deb_arch=arm64
+    cloudwatch_arch=arm64
+    ;;
+  *)
+    printf 'Unsupported build architecture: %s\n' "${BUILD_ARCH}" >&2
+    exit 2
+    ;;
+esac
 
 aws_zip="/tmp/awscliv2.zip"
 curl --fail --location --retry 5 \
-  "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
+  "https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip" \
   -o "${aws_zip}"
 unzip -q "${aws_zip}" -d /tmp
 sudo /tmp/aws/install --update
@@ -17,14 +34,18 @@ curl --fail --location --retry 5 \
   "https://releases.nixos.org/nix/nix-${NIX_VERSION}/install" \
   -o "${nix_installer}"
 sudo sh "${nix_installer}" --daemon --yes
+sudo ln -sfn /nix/var/nix/profiles/default/bin/nix /usr/local/bin/nix
+sudo ln -sfn /nix/var/nix/profiles/default/bin/nix-daemon /usr/local/bin/nix-daemon
+sudo ln -sfn /nix/var/nix/profiles/default/bin/nix-store /usr/local/bin/nix-store
 
 runner_archive="/tmp/actions-runner.tar.gz"
 curl --fail --location --retry 5 \
-  "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" \
+  "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz" \
   -o "${runner_archive}"
 printf '%s  %s\n' "${RUNNER_SHA256}" "${runner_archive}" | sha256sum --check
 
 sudo useradd --create-home --shell /bin/bash gha-runner
+sudo useradd --create-home --shell /bin/bash nixremote
 sudo install -d -o gha-runner -g gha-runner /opt/actions-runner-dist
 sudo tar -xzf "${runner_archive}" -C /opt/actions-runner-dist
 sudo /opt/actions-runner-dist/bin/installdependencies.sh
@@ -34,7 +55,7 @@ if snap list amazon-ssm-agent >/dev/null 2>&1; then
 else
   ssm_deb="/tmp/amazon-ssm-agent.deb"
   curl --fail --location --retry 5 \
-    "https://s3.${AWS_REGION}.amazonaws.com/amazon-ssm-${AWS_REGION}/latest/debian_amd64/amazon-ssm-agent.deb" \
+    "https://s3.${AWS_REGION}.amazonaws.com/amazon-ssm-${AWS_REGION}/latest/debian_${deb_arch}/amazon-ssm-agent.deb" \
     -o "${ssm_deb}"
   sudo dpkg -i "${ssm_deb}"
   sudo systemctl enable amazon-ssm-agent
@@ -42,7 +63,7 @@ fi
 
 cloudwatch_deb="/tmp/amazon-cloudwatch-agent.deb"
 curl --fail --location --retry 5 \
-  "https://amazoncloudwatch-agent-${AWS_REGION}.s3.${AWS_REGION}.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb" \
+  "https://amazoncloudwatch-agent-${AWS_REGION}.s3.${AWS_REGION}.amazonaws.com/ubuntu/${cloudwatch_arch}/latest/amazon-cloudwatch-agent.deb" \
   -o "${cloudwatch_deb}"
 sudo dpkg -i "${cloudwatch_deb}"
 
@@ -63,8 +84,13 @@ experimental-features = nix-command flakes
 accept-flake-config = true
 max-jobs = auto
 cores = 0
-trusted-users = root gha-runner
+trusted-users = root gha-runner nixremote
 EOF
+
+# Every instance receives unique SSH host keys on first boot. Baking host keys
+# into the AMI would make host-key pinning meaningless.
+sudo systemctl disable --now ssh.service ssh.socket 2>/dev/null || true
+sudo rm -f /etc/ssh/ssh_host_*
 
 sudo apt-get clean
 sudo rm -rf /var/lib/apt/lists/* /tmp/aws /tmp/awscliv2.zip /tmp/actions-runner.tar.gz /tmp/nix-aws-runtime

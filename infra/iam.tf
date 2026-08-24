@@ -65,6 +65,24 @@ resource "aws_iam_instance_profile" "runner" {
   role = aws_iam_role.runner.name
 }
 
+resource "aws_iam_role" "local_runner" {
+  name = "${var.project_name}-local-runner"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_instance_profile" "local_runner" {
+  name = "${var.project_name}-local-runner"
+  role = aws_iam_role.local_runner.name
+}
+
 data "aws_iam_policy_document" "github_provisioner" {
   statement {
     sid = "ManageEphemeralFleet"
@@ -105,7 +123,10 @@ data "aws_iam_policy_document" "github_provisioner" {
       "ssm:GetParameter",
       "ssm:PutParameter",
     ]
-    resources = ["arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/runs/*"]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/runs/*",
+      "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/sessions/*",
+    ]
   }
 
   statement {
@@ -122,6 +143,17 @@ data "aws_iam_policy_document" "github_provisioner" {
     actions   = ["kms:Encrypt", "kms:GenerateDataKey"]
     resources = [aws_kms_key.runner_config.arn]
   }
+
+  statement {
+    sid = "CoordinateGlobalBuildLease"
+    actions = [
+      "dynamodb:DeleteItem",
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+    ]
+    resources = [aws_dynamodb_table.build_lock.arn]
+  }
 }
 
 resource "aws_iam_role_policy" "github_provisioner" {
@@ -132,9 +164,12 @@ resource "aws_iam_role_policy" "github_provisioner" {
 
 data "aws_iam_policy_document" "runner" {
   statement {
-    sid       = "ReadRunConfiguration"
-    actions   = ["ssm:GetParameter", "ssm:DeleteParameter"]
-    resources = ["arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/runs/*"]
+    sid     = "ReadRunConfiguration"
+    actions = ["ssm:GetParameter", "ssm:DeleteParameter", "ssm:PutParameter"]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/runs/*",
+      "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/sessions/*",
+    ]
   }
 
   statement {
@@ -193,6 +228,225 @@ resource "aws_iam_role_policy_attachment" "runner_ssm" {
   policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+data "aws_iam_policy_document" "local_runner" {
+  statement {
+    sid     = "ReadLocalSessionConfiguration"
+    actions = ["ssm:GetParameter", "ssm:DeleteParameter", "ssm:PutParameter"]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/sessions/*",
+    ]
+  }
+
+  statement {
+    sid       = "ReadCacheConfiguration"
+    actions   = ["ssm:GetParameter", "ssm:GetParameters"]
+    resources = ["arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/config/*"]
+  }
+
+  statement {
+    sid       = "DecryptLocalSessionConfiguration"
+    actions   = ["kms:Decrypt"]
+    resources = [aws_kms_key.runner_config.arn]
+  }
+
+  statement {
+    sid       = "ReadOnlyLocalSigningKey"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.cache_local_signing_key.arn]
+  }
+
+  statement {
+    sid = "WriteBinaryCacheWithoutDelete"
+    actions = [
+      "s3:AbortMultipartUpload",
+      "s3:GetObject",
+      "s3:PutObject",
+    ]
+    resources = ["${aws_s3_bucket.cache.arn}/*"]
+  }
+
+  statement {
+    sid       = "InspectBinaryCache"
+    actions   = ["s3:GetBucketLocation", "s3:ListBucket"]
+    resources = [aws_s3_bucket.cache.arn]
+  }
+
+  statement {
+    sid = "PublishRunnerLogs"
+    actions = [
+      "logs:CreateLogStream",
+      "logs:DescribeLogStreams",
+      "logs:PutLogEvents",
+    ]
+    resources = ["${aws_cloudwatch_log_group.runners.arn}:*"]
+  }
+}
+
+resource "aws_iam_role_policy" "local_runner" {
+  name   = "${var.project_name}-local-runner"
+  role   = aws_iam_role.local_runner.id
+  policy = data.aws_iam_policy_document.local_runner.json
+}
+
+resource "aws_iam_role_policy_attachment" "local_runner_ssm" {
+  role       = aws_iam_role.local_runner.name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+# This document is handed to the organization IAM Identity Center
+# administrator. OpenTofu deliberately does not create or assign the central
+# permission set from this member account.
+data "aws_iam_policy_document" "local_operator" {
+  statement {
+    sid = "LaunchAndInspectEphemeralBuilders"
+    actions = [
+      "ec2:CreateFleet",
+      "ec2:CreateLaunchTemplate",
+      "ec2:DescribeFleetInstances",
+      "ec2:DescribeFleets",
+      "ec2:DescribeInstances",
+      "ec2:DescribeInstanceStatus",
+      "ec2:DescribeLaunchTemplates",
+      "ec2:DescribeLaunchTemplateVersions",
+      "ec2:DescribeSpotPriceHistory",
+      "ec2:RunInstances",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "TagOnlyDuringBuilderCreation"
+    actions   = ["ec2:CreateTags"]
+    resources = ["arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:*/*"]
+
+    condition {
+      test     = "ForAnyValue:StringEquals"
+      variable = "ec2:CreateAction"
+      values   = ["CreateFleet", "CreateLaunchTemplate", "RunInstances"]
+    }
+  }
+
+  statement {
+    sid = "DeleteOnlyTaggedBuilderResources"
+    actions = [
+      "ec2:DeleteFleets",
+      "ec2:DeleteLaunchTemplate",
+      "ec2:TerminateInstances",
+    ]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:fleet/*",
+      "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*",
+      "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:launch-template/*",
+    ]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:ResourceTag/ManagedBy"
+      values   = [var.project_name]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:ResourceTag/Project"
+      values   = [var.project_name]
+    }
+  }
+
+  statement {
+    sid       = "PassOnlyNixBuilderRole"
+    actions   = ["iam:PassRole"]
+    resources = [aws_iam_role.local_runner.arn]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PassedToService"
+      values   = ["ec2.amazonaws.com"]
+    }
+  }
+
+  statement {
+    sid = "ManageLocalSessionParameters"
+    actions = [
+      "ssm:DeleteParameter",
+      "ssm:GetParameter",
+      "ssm:PutParameter",
+    ]
+    resources = ["arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/sessions/*"]
+  }
+
+  statement {
+    sid     = "ReadNixBuilderConfiguration"
+    actions = ["ssm:GetParameter", "ssm:GetParameters"]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/ami/*",
+      "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/config/*",
+    ]
+  }
+
+  statement {
+    sid       = "UsePortForwardingOnTaggedBuilder"
+    actions   = ["ssm:StartSession"]
+    resources = ["arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ssm:resourceTag/ManagedBy"
+      values   = [var.project_name]
+    }
+  }
+
+  statement {
+    sid       = "UseAWSManagedPortForwardingDocument"
+    actions   = ["ssm:StartSession"]
+    resources = ["arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}::document/AWS-StartPortForwardingSession"]
+  }
+
+  statement {
+    sid       = "ManageOwnSSMSession"
+    actions   = ["ssm:ResumeSession", "ssm:TerminateSession", "ssmmessages:OpenDataChannel"]
+    resources = ["arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:session/$${aws:userid}-*"]
+  }
+
+  statement {
+    sid       = "EncryptLocalBuilderConfiguration"
+    actions   = ["kms:Encrypt", "kms:GenerateDataKey"]
+    resources = [aws_kms_key.runner_config.arn]
+  }
+
+  statement {
+    sid       = "ReadOnlyLocalSigningKey"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.cache_local_signing_key.arn]
+  }
+
+  statement {
+    sid = "PublishBinaryCacheWithoutDelete"
+    actions = [
+      "s3:AbortMultipartUpload",
+      "s3:GetObject",
+      "s3:PutObject",
+    ]
+    resources = ["${aws_s3_bucket.cache.arn}/*"]
+  }
+
+  statement {
+    sid       = "InspectDedicatedBinaryCache"
+    actions   = ["s3:GetBucketLocation", "s3:ListBucket"]
+    resources = [aws_s3_bucket.cache.arn]
+  }
+
+  statement {
+    sid = "CoordinateAndReadBuildCosts"
+    actions = [
+      "dynamodb:DeleteItem",
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:Scan",
+      "dynamodb:UpdateItem",
+    ]
+    resources = [aws_dynamodb_table.build_lock.arn]
+  }
+}
+
 data "aws_iam_policy_document" "github_image_assume" {
   statement {
     actions = ["sts:AssumeRoleWithWebIdentity"]
@@ -212,7 +466,7 @@ data "aws_iam_policy_document" "github_image_assume" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_owner}@${var.github_owner_id}/nix-aws-build-infra@${var.allowed_repositories["nix-aws-build-infra"]}:environment:${var.github_environment}"]
+      values   = ["repo:${var.github_owner}@${var.github_owner_id}/${var.infra_repository_name}@${var.allowed_repositories[var.infra_repository_name]}:environment:${var.github_environment}"]
     }
   }
 }
@@ -270,9 +524,12 @@ resource "aws_iam_role_policy" "github_image_builder" {
         Resource = "*"
       },
       {
-        Effect   = "Allow"
-        Action   = ["ssm:PutParameter"]
-        Resource = aws_ssm_parameter.builder_ami.arn
+        Effect = "Allow"
+        Action = ["ssm:PutParameter"]
+        Resource = concat(
+          [aws_ssm_parameter.builder_ami.arn],
+          [for parameter in aws_ssm_parameter.builder_amis : parameter.arn],
+        )
       },
     ]
   })

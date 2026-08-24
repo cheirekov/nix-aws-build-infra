@@ -1,6 +1,11 @@
 .direnv/
 .envrc
 .secrets/
+.deployment/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
 result
 result-*
 

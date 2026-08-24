@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nix-aws-build"
+version = "0.1.0"
+description = "Local and ephemeral AWS Nix build orchestration"
+requires-python = ">=3.11"
+
+[project.scripts]
+nix-aws = "nix_aws.cli:main"
+
+[tool.setuptools]
+packages = ["nix_aws"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]

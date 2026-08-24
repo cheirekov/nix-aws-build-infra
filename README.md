@@ -1,128 +1,157 @@
 # nix-aws-build-infra
 
-Reusable infrastructure for one-job GitHub Actions runners on EC2 Spot and a
-signed Nix binary cache backed by private S3 and public read-only CloudFront.
-The default deployment targets `eu-central-1`, accepts one trusted build at a
-time, and leaves no runner instance or EBS volume behind after a job.
+Reusable infrastructure for signed Nix binary caches and ephemeral native
+`x86_64-linux`/`aarch64-linux` builders on AWS EC2 Spot. It supports trusted
+GitHub Actions repositories and explicit local remote builds without inbound
+network ports or long-lived AWS access keys.
 
-## Architecture
+The repository is a tenant-neutral template. Owner IDs, repository IDs,
+signing keys, AWS state, email addresses and account identifiers are generated
+or discovered into ignored deployment files. The `deployments/` directory
+contains optional, public, read-only references; generic code does not default
+to any reference deployment.
 
-1. A GitHub-hosted provisioning job assumes a narrowly scoped AWS role through
-   GitHub OIDC and requests a short-lived runner registration token through a
-   GitHub App.
-2. EC2 Fleet selects one 32-vCPU Spot instance from the configured types and
-   availability zones. The runner has no inbound security-group rules.
-3. The AMI fetches its one-time configuration from encrypted SSM Parameter
-   Store, exposes the pinned Nix installation to non-login Actions shells,
-   registers as an ephemeral runner, and executes exactly one job.
-4. Nix reads from CloudFront and uploads signed completed outputs directly to
-   the private S3 cache. This preserves useful work if Spot is interrupted.
-5. An unconditional cleanup job removes the fleet, instance, launch template,
-   SSM parameter and stale runner entry. A 12-hour AWS watchdog is the fallback.
+## What it provides
 
-## Bootstrap and deploy
+- private S3 binary-cache origin with public read-only CloudFront access;
+- separate CI and local-publisher Nix signing identities;
+- one-job ephemeral GitHub runners registered through a GitHub App;
+- GitHub OIDC and AWS IAM Identity Center instead of permanent AWS keys;
+- `standard` 16-vCPU and `large` 32-vCPU Spot profiles;
+- native x86_64 and ARM64 Packer images;
+- local `nix-aws build`, reusable sessions, cache publishing, logs and cost
+  estimates;
+- DynamoDB concurrency lease, unconditional cleanup and a 12-hour watchdog;
+- OpenTofu budget alarms, cache-size alarm and AMI/snapshot retention.
 
-Prerequisites are provided by the Nix development shell:
+Local builds are the default and create no EC2 resources. Remote instances
+exist only for `--remote`, `session start`, or a trusted workflow invocation.
+There is no automatic On-Demand fallback.
+
+## Start here
+
+The complete fresh-fork procedure is in [Quick start](docs/quickstart.md). The
+safe sequence is deliberately split into reviewable phases:
 
 ```console
 nix develop
-aws sts get-caller-identity
+./scripts/init-deployment.sh --github-owner OWNER \
+  --infra-repository nix-aws-build-infra \
+  --repository TRUSTED_BUILD_REPOSITORY
+
+export NIX_AWS_INFRA_PROFILE=APPROVED_SSO_INFRA_ADMIN_PROFILE
 ./scripts/bootstrap-state.sh
-./scripts/generate-signing-key.sh
-./scripts/deploy.sh
+./scripts/deploy.sh plan
+tofu -chdir=infra show ../.deployment/infra.tfplan
+./scripts/deploy.sh apply
 ```
 
-`deploy.sh` applies OpenTofu, uploads the private signing key to Secrets
-Manager, builds the Packer AMI and publishes its ID to SSM. It does not create
-the GitHub App or GitHub repository secrets.
+`init-deployment.sh` only performs GitHub read-only discovery and writes
+ignored local files. `bootstrap-state.sh`, `apply`, and AMI builds are explicit
+AWS mutations. `apply` accepts only the saved plan; it never uses
+`-auto-approve`. AMI construction is a separate `deploy.sh build-amis` step or
+the protected `build runner AMI` workflow.
 
-Create a GitHub App owned by `cheirekov`, install it only on approved build
-repositories, and grant repository **Administration: read and write** plus
-**Metadata: read**. In each caller repository configure:
+Do not commit `.deployment/`, `.secrets/`, `infra/backend.hcl`, plans, Packer
+manifests, or Terraform state. They are ignored by this repository.
 
-- environment `aws-build`, restricted to the `main` branch;
-- variable `NIX_AWS_ROLE_ARN` from `tofu output github_provisioner_role_arn`;
-- variable `NIX_AWS_GITHUB_APP_ID`;
-- repository Actions secret `NIX_AWS_GITHUB_APP_PRIVATE_KEY`.
+## GitHub Actions
 
-In this infrastructure repository, also set `NIX_AWS_IMAGE_ROLE_ARN` from
-`tofu output github_image_builder_role_arn`. Disable GitHub App webhooks; no
-callback URL is required. Generate and download one App private key, store it
-only as the repository secret above, then delete the downloaded copy.
-
-The OpenTofu defaults bind AWS OIDC trust to the immutable GitHub owner and
-repository IDs as well as the protected `aws-build` environment. Update
-`github_owner_id` and the `allowed_repositories` name-to-ID map if the owner or
-allowlist changes; repository names alone do not match the default OIDC subject
-used by newly created repositories.
-
-The signing private key is generated under ignored `.secrets/`, uploaded to
-AWS, and deleted locally after a successful deployment. It is never placed in
-Git, the AMI, GitHub secrets, or OpenTofu state. Its corresponding public key
-is committed as `config/cache-public-key.txt` so clients can configure trust
-without querying AWS.
-
-## Calling the reusable workflow
+Create and install the least-privilege GitHub App as described in
+[GitHub App setup](docs/github-app.md). A trusted caller pins this repository to
+an audited commit, not a movable branch:
 
 ```yaml
 jobs:
   build:
-    uses: cheirekov/nix-aws-build-infra/.github/workflows/nix-build.yml@main
     permissions:
       contents: read
       id-token: write
+    uses: OWNER/nix-aws-build-infra/.github/workflows/nix-build.yml@FULL_COMMIT_SHA
     with:
-      flake_attribute: br
-      verification_script: ./scripts/verify.sh ./result
+      flake_attribute: package
+      runner_profile: standard-x86_64
+      # Also pass aws_region, project_name, and github_environment when the
+      # deployment does not use their documented defaults.
     secrets:
       github_app_private_key: ${{ secrets.NIX_AWS_GITHUB_APP_PRIVATE_KEY }}
 ```
 
-The reusable workflow resolves `NIX_AWS_ROLE_ARN` and
-`NIX_AWS_GITHUB_APP_ID` from the caller repository's protected `aws-build`
-environment. GitHub does not expose environment secrets across
-`workflow_call`, so the narrowly scoped App key is a repository secret passed
-explicitly through the declared `github_app_private_key` interface. Fork pull
-requests cannot access repository Actions secrets.
+The reusable workflow checks out its own helper scripts using GitHub's
+`job.workflow_repository` and `job.workflow_sha` contexts. It does not assume a
+particular owner or branch. Only allowlisted immutable owner/repository IDs and
+the protected environment can assume the AWS role. Do not invoke this
+privileged workflow for untrusted pull-request code.
 
-Do not invoke the workflow for untrusted pull-request code. The runner's
-instance role can write to the cache and read its signing key by design.
+## Local use
 
-## Local cache use
-
-After deployment, render the concrete NixOS/Home Manager example:
+Install from your own pinned fork or use its development shell:
 
 ```console
-./scripts/render-client-config.sh
+nix profile install github:OWNER/nix-aws-build-infra/FULL_COMMIT_SHA
+nix-aws build .#package
+nix-aws build --push .#package
+nix-aws build --remote --system aarch64-linux --profile standard .#package
 ```
 
-The output contains the CloudFront substituter and public signing key. The S3
-bucket remains private and blocks all public ACLs and policies; only the
-CloudFront distribution can read cache objects.
-
-## Validation
+Configure the public cache by rendering the generated client fragment after
+deployment:
 
 ```console
-./scripts/check.sh
-cd infra && tofu plan -var "cache_public_key=$(cat ../config/cache-public-key.txt)"
+./scripts/render-client-config.sh >nix-aws-cache.nix
 ```
 
-The included fixture is intentionally small. Run it through the reusable
-workflow twice: the second fresh runner should substitute it from CloudFront.
-CloudWatch retains runner logs for 14 days. Cache objects have no automatic
-expiry because deleting NARs independently of their `.narinfo` files would
-create a corrupt cache.
+Local publication and remote builders require the scoped
+`nix-aws-build` Identity Center profile. Read-only CloudFront substitution does
+not require an AWS account. See [Local usage](docs/local-usage.md) and
+[Identity Center](docs/identity-center.md).
 
-The rollout is deliberately gated:
+## Architecture and safety boundaries
 
-1. Push this repository and configure the GitHub App, environment and
-   variables.
-2. Run **cache fixture smoke test** twice and confirm the second run reports a
-   cache substitution.
-3. Run Brave's **full Brave build** workflow manually and repeat it once for a
-   cache-hit test.
-4. Only then add the trusted `push`-to-`main` trigger to the Brave caller.
+The GitHub-hosted provision job exchanges OIDC for a scoped AWS role and uses
+a short-lived GitHub App token. EC2 Fleet selects Spot capacity across instance
+families and availability zones. A one-time encrypted SSM parameter carries
+runner registration data. The instance has IMDSv2, an instance role, SSM, no
+inbound security-group rules, and delete-on-termination encrypted gp3 storage.
 
-Fork pull requests run only the unprivileged static checks. They do not invoke
-the reusable build workflow, and the AWS OIDC trust accepts only the protected
-`aws-build` environment in the two allowlisted repositories.
+Completed Nix outputs are signed and uploaded as they become available. S3
+remains private; CloudFront OAC receives only `GET`/`HEAD`. The local operator
+cannot retrieve the CI signing key, delete cache objects, or administer IAM.
+The GitHub runner and local remote-builder roles have separate signing secrets.
+
+Cleanup removes the fleet, instance, launch template, one-time parameter and
+lease even when a build fails. EventBridge/Lambda cleans tagged orphaned
+resources older than 12 hours. CloudWatch logs are retained for 14 days and
+local CLI logs for 30 days.
+
+## Cost controls
+
+Defaults are Frankfurt (`eu-central-1`), one concurrent builder, a USD 25
+monthly soft budget, public subnets without NAT Gateway, CloudFront
+`PriceClass_100`, and retention of the newest two AMIs per architecture. The
+CLI estimates current Spot, EBS and public IPv4 costs before a local remote
+session. AWS Budget notifications are delayed alerts, not a real-time hard
+cap. Identity Center itself has no additional service fee, but its organization
+administrator must assign the operator permission set.
+
+## Reproducibility and validation
+
+The Nix input, provider locks, tool versions, Nix installer version, GitHub
+runner version and runner archive hashes are pinned or lockable. AMIs are
+operationally reproducible, not byte-for-byte reproducible: they deliberately
+start from the current official Ubuntu 24.04 image and receive current security
+packages and AWS agents. See [Reproducibility](docs/reproducibility.md).
+
+Run all non-mutating checks with:
+
+```console
+nix develop --command ./scripts/check.sh
+```
+
+The suite validates OpenTofu and Packer, checks Actions and shell code, runs
+Python unit tests, verifies least-privilege assertions, and rejects known
+tenant-specific values from generic files. No check creates AWS resources.
+
+Deployment remains separate from build/cache operation. A `deploy-rs` pilot
+pattern is documented in [Deployment](docs/deployment.md); this project is not
+a FlakeHub replacement.

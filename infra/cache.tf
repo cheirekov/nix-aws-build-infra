@@ -120,6 +120,12 @@ resource "aws_secretsmanager_secret" "cache_signing_key" {
   recovery_window_in_days = 7
 }
 
+resource "aws_secretsmanager_secret" "cache_local_signing_key" {
+  name                    = "${var.project_name}/cache-local-signing-key"
+  description             = "Isolated local Nix publisher key; value managed outside OpenTofu"
+  recovery_window_in_days = 7
+}
+
 resource "aws_ssm_parameter" "cache_url" {
   name  = "${local.parameter_prefix}/config/cache-url"
   type  = "String"
@@ -138,26 +144,86 @@ resource "aws_ssm_parameter" "cache_public_key" {
   value = var.cache_public_key
 }
 
+resource "aws_ssm_parameter" "cache_local_public_key" {
+  name  = "${local.parameter_prefix}/config/cache-local-public-key"
+  type  = "String"
+  value = var.local_cache_public_key != "" ? var.local_cache_public_key : "pending"
+}
+
 resource "aws_ssm_parameter" "provisioner_config" {
   name = "${local.parameter_prefix}/config/provisioner"
   type = "String"
   value = jsonencode({
-    cache_bucket             = aws_s3_bucket.cache.id
-    cache_signing_secret_arn = aws_secretsmanager_secret.cache_signing_key.arn
-    cache_url                = "https://${aws_cloudfront_distribution.cache.domain_name}"
-    instance_profile_name    = aws_iam_instance_profile.runner.name
-    kms_key_id               = aws_kms_key.runner_config.arn
-    root_volume_gb           = var.runner_root_volume_gb
-    root_volume_iops         = var.runner_root_volume_iops
-    root_volume_throughput   = var.runner_root_volume_throughput
-    runner_security_group_id = aws_security_group.runner.id
-    runner_subnet_ids        = aws_subnet.builder[*].id
+    cache_bucket                   = aws_s3_bucket.cache.id
+    cache_signing_secret_arn       = aws_secretsmanager_secret.cache_signing_key.arn
+    local_cache_signing_secret_arn = aws_secretsmanager_secret.cache_local_signing_key.arn
+    cache_url                      = "https://${aws_cloudfront_distribution.cache.domain_name}"
+    build_lock_table               = aws_dynamodb_table.build_lock.name
+    instance_profile_name          = aws_iam_instance_profile.runner.name
+    local_instance_profile_name    = aws_iam_instance_profile.local_runner.name
+    kms_key_id                     = aws_kms_key.runner_config.arn
+    root_volume_gb                 = var.runner_root_volume_gb
+    root_volume_iops               = var.runner_root_volume_iops
+    root_volume_throughput         = var.runner_root_volume_throughput
+    runner_security_group_id       = aws_security_group.runner.id
+    runner_subnet_ids              = aws_subnet.builder[*].id
+    ami_parameters = {
+      x86_64-linux  = aws_ssm_parameter.builder_amis["x86_64-linux"].name
+      aarch64-linux = aws_ssm_parameter.builder_amis["aarch64-linux"].name
+    }
+    profiles = {
+      x86_64-linux = {
+        standard = {
+          instance_types         = ["c7i.4xlarge", "m7i.4xlarge", "c6i.4xlarge", "m6i.4xlarge"]
+          root_volume_gb         = var.standard_runner_root_volume_gb
+          root_volume_iops       = var.standard_runner_root_volume_iops
+          root_volume_throughput = var.standard_runner_root_volume_throughput
+          ttl_hours              = 4
+        }
+        large = {
+          instance_types         = ["c7i.8xlarge", "m7i.8xlarge", "c6i.8xlarge", "m6i.8xlarge"]
+          root_volume_gb         = var.runner_root_volume_gb
+          root_volume_iops       = var.runner_root_volume_iops
+          root_volume_throughput = var.runner_root_volume_throughput
+          ttl_hours              = 10
+        }
+      }
+      aarch64-linux = {
+        standard = {
+          instance_types         = ["c7g.4xlarge", "m7g.4xlarge", "c6g.4xlarge", "m6g.4xlarge"]
+          root_volume_gb         = var.standard_runner_root_volume_gb
+          root_volume_iops       = var.standard_runner_root_volume_iops
+          root_volume_throughput = var.standard_runner_root_volume_throughput
+          ttl_hours              = 4
+        }
+        large = {
+          instance_types         = ["c7g.8xlarge", "m7g.8xlarge", "c6g.8xlarge", "m6g.8xlarge"]
+          root_volume_gb         = var.runner_root_volume_gb
+          root_volume_iops       = var.runner_root_volume_iops
+          root_volume_throughput = var.runner_root_volume_throughput
+          ttl_hours              = 10
+        }
+      }
+    }
   })
 }
 
+# Legacy pointer retained while existing callers move to the system-specific
+# parameters below.
 resource "aws_ssm_parameter" "builder_ami" {
   name        = "${local.parameter_prefix}/ami/current"
   description = "Current Packer-built ephemeral runner AMI"
+  type        = "String"
+  value       = "pending"
+
+  lifecycle { ignore_changes = [value] }
+}
+
+resource "aws_ssm_parameter" "builder_amis" {
+  for_each = toset(["x86_64-linux", "aarch64-linux"])
+
+  name        = "${local.parameter_prefix}/ami/${each.key}"
+  description = "Current Packer-built ephemeral runner AMI for ${each.key}"
   type        = "String"
   value       = "pending"
 

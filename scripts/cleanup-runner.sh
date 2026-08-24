@@ -9,6 +9,8 @@ instance_id="${INSTANCE_ID:-}"
 launch_template_id="${LAUNCH_TEMPLATE_ID:-}"
 runner_name="${RUNNER_NAME:-}"
 ssm_parameter="${SSM_PARAMETER:-}"
+lock_table="${LOCK_TABLE:-}"
+lock_owner="${LOCK_OWNER:-}"
 
 if [[ -n "${fleet_id}" ]]; then
   aws ec2 delete-fleets \
@@ -25,6 +27,15 @@ if [[ -n "${launch_template_id}" ]]; then
 fi
 if [[ -n "${ssm_parameter}" ]]; then
   aws ssm delete-parameter --region "${aws_region}" --name "${ssm_parameter}" >/dev/null 2>&1 || true
+fi
+if [[ -n "${lock_table}" && -n "${lock_owner}" ]]; then
+  aws dynamodb delete-item \
+    --region "${aws_region}" \
+    --table-name "${lock_table}" \
+    --key '{"pk":{"S":"GLOBAL"}}' \
+    --condition-expression '#owner = :owner' \
+    --expression-attribute-names '{"#owner":"owner"}' \
+    --expression-attribute-values "{\":owner\":{\"S\":\"${lock_owner}\"}}" >/dev/null 2>&1 || true
 fi
 
 if [[ -n "${runner_name}" ]]; then

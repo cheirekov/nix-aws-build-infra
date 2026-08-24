@@ -8,12 +8,39 @@ github_repository="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 github_run_id="${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}"
 github_run_attempt="${GITHUB_RUN_ATTEMPT:-1}"
 github_output="${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}"
+runner_profile="${RUNNER_PROFILE:-large-x86_64}"
 run_key="${github_run_id}-${github_run_attempt}"
 runner_name="nix-aws-${run_key}"
 runner_label="nix-aws-run-${run_key}"
 parameter_name="/${project_name}/runs/${run_key}"
 launch_template_name="${project_name}-run-${run_key}"
-instance_types='["c7i.8xlarge","m7i.8xlarge","c6i.8xlarge","m6i.8xlarge"]'
+
+case "${runner_profile}" in
+  standard-x86_64)
+    nix_system=x86_64-linux
+    capacity_profile=standard
+    github_arch=x64
+    ;;
+  large-x86_64)
+    nix_system=x86_64-linux
+    capacity_profile=large
+    github_arch=x64
+    ;;
+  standard-aarch64)
+    nix_system=aarch64-linux
+    capacity_profile=standard
+    github_arch=ARM64
+    ;;
+  large-aarch64)
+    nix_system=aarch64-linux
+    capacity_profile=large
+    github_arch=ARM64
+    ;;
+  *)
+    printf 'Unsupported runner profile: %s\n' "${runner_profile}" >&2
+    exit 2
+    ;;
+esac
 
 log() {
   printf '[provision] %s\n' "$*" >&2
@@ -40,6 +67,15 @@ cleanup_partial() {
     aws ec2 delete-launch-template --region "${aws_region}" --launch-template-id "${launch_template_id}" >/dev/null 2>&1 || true
   fi
   aws ssm delete-parameter --region "${aws_region}" --name "${parameter_name}" >/dev/null 2>&1 || true
+  if [[ -n "${lock_table:-}" ]]; then
+    aws dynamodb delete-item \
+      --region "${aws_region}" \
+      --table-name "${lock_table}" \
+      --key '{"pk":{"S":"GLOBAL"}}' \
+      --condition-expression '#owner = :owner' \
+      --expression-attribute-names '{"#owner":"owner"}' \
+      --expression-attribute-values "{\":owner\":{\"S\":\"${lock_owner}\"}}" >/dev/null 2>&1 || true
+  fi
   return "${status}"
 }
 trap cleanup_partial ERR
@@ -54,9 +90,20 @@ provisioner_config="$(aws ssm get-parameter \
   --name "/${project_name}/config/provisioner" \
   --query Parameter.Value \
   --output text)"
+lock_table="$(jq -er .build_lock_table <<<"${provisioner_config}")"
+lock_owner="gha-${run_key}"
+lock_expires_at="$(($(date +%s) + 43200))"
+aws dynamodb put-item \
+  --region "${aws_region}" \
+  --table-name "${lock_table}" \
+  --item "{\"pk\":{\"S\":\"GLOBAL\"},\"owner\":{\"S\":\"${lock_owner}\"},\"expires_at\":{\"N\":\"${lock_expires_at}\"},\"created_at\":{\"N\":\"$(date +%s)\"}}" \
+  --condition-expression 'attribute_not_exists(pk) OR expires_at < :now' \
+  --expression-attribute-values "{\":now\":{\"N\":\"$(date +%s)\"}}" >/dev/null
+printf 'lock_table=%s\nlock_owner=%s\n' "${lock_table}" "${lock_owner}" >>"${github_output}"
+
 ami_id="$(aws ssm get-parameter \
   --region "${aws_region}" \
-  --name "/${project_name}/ami/current" \
+  --name "/${project_name}/ami/${nix_system}" \
   --query Parameter.Value \
   --output text)"
 if [[ ! "${ami_id}" =~ ^ami-[[:xdigit:]]+$ ]]; then
@@ -71,13 +118,18 @@ subnet_ids="$(jq -ec .runner_subnet_ids <<<"${provisioner_config}")"
 root_volume_gb="$(jq -er .root_volume_gb <<<"${provisioner_config}")"
 root_volume_iops="$(jq -er .root_volume_iops <<<"${provisioner_config}")"
 root_volume_throughput="$(jq -er .root_volume_throughput <<<"${provisioner_config}")"
+profile_config="$(jq -ec --arg system "${nix_system}" --arg profile "${capacity_profile}" '.profiles[$system][$profile]' <<<"${provisioner_config}")"
+instance_types="$(jq -ec .instance_types <<<"${profile_config}")"
+root_volume_gb="$(jq -er .root_volume_gb <<<"${profile_config}")"
+root_volume_iops="$(jq -er .root_volume_iops <<<"${profile_config}")"
+root_volume_throughput="$(jq -er .root_volume_throughput <<<"${profile_config}")"
 
 run_config="$(jq -cn \
   --arg repository_url "https://github.com/${github_repository}" \
   --arg registration_token "${registration_token}" \
   --arg runner_name "${runner_name}" \
-  --arg runner_labels "nix-aws,large-x86_64,${runner_label}" \
-  '{repository_url:$repository_url,registration_token:$registration_token,runner_name:$runner_name,runner_labels:$runner_labels}')"
+  --arg runner_labels "nix-aws,${runner_profile},${runner_label}" \
+  '{mode:"github-runner",repository_url:$repository_url,registration_token:$registration_token,runner_name:$runner_name,runner_labels:$runner_labels}')"
 aws ssm put-parameter \
   --region "${aws_region}" \
   --name "${parameter_name}" \
@@ -115,15 +167,15 @@ launch_data="$(jq -cn \
     InstanceInitiatedShutdownBehavior:"terminate",
     BlockDeviceMappings:[{DeviceName:"/dev/sda1",Ebs:{DeleteOnTermination:true,Encrypted:true,VolumeType:"gp3",VolumeSize:$root_volume_gb,Iops:$root_volume_iops,Throughput:$root_volume_throughput}}],
     TagSpecifications:[
-      {ResourceType:"instance",Tags:[{Key:"Name",Value:$runner_name},{Key:"ManagedBy",Value:$project_name},{Key:"GitHubRunId",Value:$run_key},{Key:"RunnerName",Value:$runner_name}]},
-      {ResourceType:"volume",Tags:[{Key:"Name",Value:$runner_name},{Key:"ManagedBy",Value:$project_name},{Key:"GitHubRunId",Value:$run_key}]}
+      {ResourceType:"instance",Tags:[{Key:"Name",Value:$runner_name},{Key:"ManagedBy",Value:$project_name},{Key:"Project",Value:$project_name},{Key:"GitHubRunId",Value:$run_key},{Key:"RunnerName",Value:$runner_name}]},
+      {ResourceType:"volume",Tags:[{Key:"Name",Value:$runner_name},{Key:"ManagedBy",Value:$project_name},{Key:"Project",Value:$project_name},{Key:"GitHubRunId",Value:$run_key}]}
     ]
   }')"
 
 launch_template_id="$(aws ec2 create-launch-template \
   --region "${aws_region}" \
   --launch-template-name "${launch_template_name}" \
-  --tag-specifications "ResourceType=launch-template,Tags=[{Key=ManagedBy,Value=${project_name}},{Key=GitHubRunId,Value=${run_key}}]" \
+  --tag-specifications "ResourceType=launch-template,Tags=[{Key=ManagedBy,Value=${project_name}},{Key=Project,Value=${project_name}},{Key=GitHubRunId,Value=${run_key}}]" \
   --launch-template-data "${launch_data}" \
   --query LaunchTemplate.LaunchTemplateId \
   --output text)"
@@ -141,7 +193,7 @@ fleet_config="$(jq -cn \
     SpotOptions:{AllocationStrategy:"price-capacity-optimized",InstanceInterruptionBehavior:"terminate"},
     TargetCapacitySpecification:{TotalTargetCapacity:1,DefaultTargetCapacityType:"spot"},
     LaunchTemplateConfigs:[{LaunchTemplateSpecification:{LaunchTemplateId:$launch_template_id,Version:"$Latest"},Overrides:$overrides}],
-    TagSpecifications:[{ResourceType:"fleet",Tags:[{Key:"ManagedBy",Value:$project_name},{Key:"GitHubRunId",Value:$run_key}]}]
+    TagSpecifications:[{ResourceType:"fleet",Tags:[{Key:"ManagedBy",Value:$project_name},{Key:"Project",Value:$project_name},{Key:"GitHubRunId",Value:$run_key}]}]
   }')"
 
 fleet_output="$(aws ec2 create-fleet --region "${aws_region}" --cli-input-json "${fleet_config}")"
@@ -157,7 +209,7 @@ while ((SECONDS < deadline)); do
   runner_status="$(api "https://api.github.com/repos/${github_repository}/actions/runners?per_page=100" |
     jq -r --arg name "${runner_name}" '.runners[]? | select(.name==$name) | .status' | head -n1)"
   if [[ "${runner_status}" == "online" ]]; then
-    runs_on="$(jq -cn --arg label "${runner_label}" '["self-hosted","linux","x64",$label]')"
+    runs_on="$(jq -cn --arg arch "${github_arch}" --arg label "${runner_label}" '["self-hosted","linux",$arch,$label]')"
     printf 'runner_name=%s\nrunner_label=%s\nruns_on=%s\nssm_parameter=%s\n' \
       "${runner_name}" "${runner_label}" "${runs_on}" "${parameter_name}" >>"${github_output}"
     trap - ERR

@@ -1,5 +1,5 @@
 [Unit]
-Description=One-job GitHub Actions Nix runner
+Description=Ephemeral GitHub Actions or remote Nix builder
 After=network-online.target
 Wants=network-online.target
 

@@ -5,6 +5,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 iam_file="${repo_root}/infra/iam.tf"
 network_file="${repo_root}/infra/network.tf"
 cache_file="${repo_root}/infra/cache.tf"
+cli_file="${repo_root}/nix_aws/cli.py"
+runtime_file="${repo_root}/packer/runtime/start-runner.sh"
 
 require_pattern() {
   local pattern="$1"
@@ -29,8 +31,8 @@ reject_pattern() {
 # watchdog's parameter enumeration call.
 reject_pattern 'actions?\s*=\s*\[?"\*"' "${repo_root}/infra"
 wildcard_resources="$(rg --count-matches '(?i)resources?\s*=\s*\[?"\*"' "${iam_file}" "${repo_root}/infra/operations.tf" | awk -F: '{ total += $2 } END { print total + 0 }')"
-if [[ "${wildcard_resources}" -ne 4 ]]; then
-  printf 'Expected exactly 4 reviewed wildcard-resource statements, found %s.\n' "${wildcard_resources}" >&2
+if [[ "${wildcard_resources}" -ne 5 ]]; then
+  printf 'Expected exactly 5 reviewed wildcard-resource statements, found %s.\n' "${wildcard_resources}" >&2
   exit 1
 fi
 
@@ -39,15 +41,25 @@ fi
 # role. The only PassRole target is the runner.
 require_pattern 'variable = "token.actions.githubusercontent.com:aud"[[:space:]]+values[[:space:]]+= \["sts.amazonaws.com"\]' "${iam_file}"
 require_pattern 'repo:\$\{var.github_owner\}@\$\{var.github_owner_id\}/\$\{repository\}@\$\{repository_id\}:environment:\$\{var.github_environment\}' "${iam_file}"
-require_pattern 'nix-aws-build-infra@\$\{var.allowed_repositories\["nix-aws-build-infra"\]\}:environment:\$\{var.github_environment\}' "${iam_file}"
+require_pattern '\$\{var.infra_repository_name\}@\$\{var.allowed_repositories\[var.infra_repository_name\]\}:environment:\$\{var.github_environment\}' "${iam_file}"
 require_pattern 'actions[[:space:]]+= \["iam:PassRole"\][[:space:]]+resources = \[aws_iam_role.runner.arn\]' "${iam_file}"
+require_pattern 'actions[[:space:]]+= \["iam:PassRole"\][[:space:]]+resources = \[aws_iam_role.local_runner.arn\]' "${iam_file}"
+require_pattern 'variable = "ec2:ResourceTag/ManagedBy"[[:space:]]+values[[:space:]]+= \[var.project_name\]' "${iam_file}"
+require_pattern 'variable = "ssm:resourceTag/ManagedBy"[[:space:]]+values[[:space:]]+= \[var.project_name\]' "${iam_file}"
+require_pattern 'session/\$\$\{aws:userid\}-\*' "${iam_file}"
 
 # The runner can read only its project secret/parameters and write only the
 # dedicated cache bucket. CloudFront receives GetObject but no write action.
 require_pattern 'actions[[:space:]]+= \["secretsmanager:GetSecretValue"\][[:space:]]+resources = \[aws_secretsmanager_secret.cache_signing_key.arn\]' "${iam_file}"
+require_pattern 'resources = \[aws_secretsmanager_secret.cache_local_signing_key.arn\]' "${iam_file}"
+reject_pattern 'data "aws_iam_policy_document" "local_runner"[[:space:][:print:]]*resources = \[aws_secretsmanager_secret.cache_signing_key.arn\]' "${iam_file}"
+require_pattern 'config\["local_instance_profile_name"\]' "${cli_file}"
+require_pattern 'run_mode.*remote-builder[[:space:][:print:]]*local_cache_signing_secret_arn' "${runtime_file}"
 require_pattern 'resources = \["\$\{aws_s3_bucket.cache.arn\}/\*"\]' "${iam_file}"
 require_pattern 'actions[[:space:]]+= \["s3:GetObject"\][[:space:]]+resources = \["\$\{aws_s3_bucket.cache.arn\}/\*"\]' "${cache_file}"
 reject_pattern 'CloudFrontReadOnly[[:space:][:print:]]*s3:PutObject' "${cache_file}"
+reject_pattern 'PublishBinaryCacheWithoutDelete[[:space:][:print:]]*s3:DeleteObject' "${iam_file}"
+require_pattern 'resources = \[aws_dynamodb_table.build_lock.arn\]' "${iam_file}"
 
 # Runtime builders deliberately expose no inbound port.
 reject_pattern '(^|[[:space:]])ingress[[:space:]]*\{' "${network_file}"

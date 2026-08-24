@@ -33,7 +33,10 @@ resource "aws_iam_role_policy" "watchdog" {
         Action = [
           "ec2:DeleteFleets",
           "ec2:DeleteLaunchTemplate",
+          "ec2:DeleteSnapshot",
+          "ec2:DeregisterImage",
           "ec2:DescribeFleets",
+          "ec2:DescribeImages",
           "ec2:DescribeInstances",
           "ec2:DescribeLaunchTemplates",
           "ec2:TerminateInstances",
@@ -46,9 +49,17 @@ resource "aws_iam_role_policy" "watchdog" {
         Resource = "*"
       },
       {
+        Effect = "Allow"
+        Action = ["ssm:DeleteParameter"]
+        Resource = [
+          "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/runs/*",
+          "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/sessions/*",
+        ]
+      },
+      {
         Effect   = "Allow"
-        Action   = ["ssm:DeleteParameter"]
-        Resource = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/runs/*"
+        Action   = ["dynamodb:DeleteItem"]
+        Resource = aws_dynamodb_table.build_lock.arn
       },
       {
         Effect   = "Allow"
@@ -70,8 +81,10 @@ resource "aws_lambda_function" "watchdog" {
 
   environment {
     variables = {
-      PROJECT_NAME  = var.project_name
-      MAX_AGE_HOURS = tostring(var.watchdog_max_age_hours)
+      PROJECT_NAME               = var.project_name
+      MAX_AGE_HOURS              = tostring(var.watchdog_max_age_hours)
+      KEEP_AMIS_PER_ARCHITECTURE = tostring(var.watchdog_keep_amis_per_architecture)
+      LOCK_TABLE                 = aws_dynamodb_table.build_lock.name
     }
   }
 }

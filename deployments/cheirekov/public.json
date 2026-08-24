@@ -1,0 +1,16 @@
+{
+  "aws_region": "eu-central-1",
+  "project_name": "nix-aws-build-infra",
+  "github_owner": "cheirekov",
+  "github_owner_id": 16937955,
+  "infra_repository_name": "nix-aws-build-infra",
+  "allowed_repositories": {
+    "brave_browser_nix": 1340587597,
+    "nix-aws-build-infra": 1342757814
+  },
+  "monthly_budget_usd": 25,
+  "cache_url": "https://d387h9bqwrf18p.cloudfront.net",
+  "cache_public_keys": [
+    "nix-aws-build-infra-1:cU3u9sqlj9HCxWPQtV+jDuoFk7bPB5Ckru7DO4/ELvs="
+  ]
+}

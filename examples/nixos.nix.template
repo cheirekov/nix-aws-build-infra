@@ -6,7 +6,8 @@
       "https://cache.nixos.org"
     ];
     trusted-public-keys = [
-      "nix-aws-build-infra-1:PUBLIC_KEY"
+      "CI_CACHE_PUBLIC_KEY"
+      "LOCAL_CACHE_PUBLIC_KEY"
       "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
     ];
   };
