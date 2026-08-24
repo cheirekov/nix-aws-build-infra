@@ -61,6 +61,22 @@ def test_state_round_trip(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatc
     assert json.loads(app.state_file.read_text())["session_id"] == "abc"
 
 
+def test_log_files_are_private(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    app = App(argparse.Namespace())
+
+    previous_umask = os.umask(0o002)
+    try:
+        log_path = app.new_log("fixture")
+    finally:
+        os.umask(previous_umask)
+
+    assert log_path.stat().st_mode & 0o777 == 0o600
+
+
 def test_resolve_store_path_rejects_non_store_path(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

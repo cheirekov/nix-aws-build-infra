@@ -194,7 +194,10 @@ class App:
         stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
         safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-")
         self.prune_logs()
-        return self.logs_dir / f"{stamp}-{safe_label}.{suffix}"
+        path = self.logs_dir / f"{stamp}-{safe_label}.{suffix}"
+        path.touch(mode=0o600, exist_ok=True)
+        path.chmod(0o600)
+        return path
 
     def prune_logs(self, days: int = 30) -> None:
         cutoff = time.time() - days * 86400
