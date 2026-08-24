@@ -12,8 +12,23 @@ log() {
   printf '[runner-bootstrap] %s\n' "$*"
 }
 
+aws_retry() {
+  local attempt
+  for ((attempt = 1; attempt <= 12; attempt++)); do
+    if "$@"; then
+      return 0
+    fi
+    if ((attempt == 12)); then
+      log "AWS request failed after ${attempt} attempts" >&2
+      return 1
+    fi
+    log "AWS request failed (attempt ${attempt}/12); retrying in 5 seconds" >&2
+    sleep 5
+  done
+}
+
 log "loading one-time configuration ${run_parameter}"
-run_config="$(aws ssm get-parameter \
+run_config="$(aws_retry aws ssm get-parameter \
   --region "${aws_region}" \
   --name "${run_parameter}" \
   --with-decryption \
@@ -29,17 +44,17 @@ if [[ ! -x "${nix_bin_dir}/nix" ]]; then
 fi
 runner_path="${nix_bin_dir}:${PATH}"
 
-provisioner_config="$(aws ssm get-parameter \
+provisioner_config="$(aws_retry aws ssm get-parameter \
   --region "${aws_region}" \
   --name "/${project_name}/config/provisioner" \
   --query Parameter.Value \
   --output text)"
-cache_public_key="$(aws ssm get-parameter \
+cache_public_key="$(aws_retry aws ssm get-parameter \
   --region "${aws_region}" \
   --name "/${project_name}/config/cache-public-key" \
   --query Parameter.Value \
   --output text)"
-cache_local_public_key="$(aws ssm get-parameter \
+cache_local_public_key="$(aws_retry aws ssm get-parameter \
   --region "${aws_region}" \
   --name "/${project_name}/config/cache-local-public-key" \
   --query Parameter.Value \
@@ -54,7 +69,7 @@ else
 fi
 signing_key_file=/run/nix-cache-signing-key
 
-aws secretsmanager get-secret-value \
+aws_retry aws secretsmanager get-secret-value \
   --region "${aws_region}" \
   --secret-id "${signing_secret}" \
   --query SecretString \
@@ -118,7 +133,7 @@ EOF
     --arg session_id "${session_id}" \
     --arg system "$(uname -m)" \
     '{host_key:$host_key,session_id:$session_id,machine:$system}')"
-  aws ssm put-parameter \
+  aws_retry aws ssm put-parameter \
     --region "${aws_region}" \
     --name "${ready_parameter}" \
     --type String \
@@ -147,7 +162,7 @@ runner_labels="$(jq -er .runner_labels <<<"${run_config}")"
 
 # The registration token is useful once; remove its encrypted parameter before
 # any repository code starts executing.
-aws ssm delete-parameter --region "${aws_region}" --name "${run_parameter}"
+aws_retry aws ssm delete-parameter --region "${aws_region}" --name "${run_parameter}"
 unset run_config
 
 rm -rf /opt/actions-runner

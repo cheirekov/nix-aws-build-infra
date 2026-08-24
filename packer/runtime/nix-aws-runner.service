@@ -2,13 +2,16 @@
 Description=Ephemeral GitHub Actions or remote Nix builder
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=5min
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=/opt/nix-aws-build-infra/bin/start-runner.sh
 TimeoutStartSec=12h
 TimeoutStopSec=5min
-Restart=no
+Restart=on-failure
+RestartSec=15s
 
 [Install]
 WantedBy=multi-user.target
