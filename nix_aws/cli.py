@@ -371,7 +371,14 @@ class App:
             raise NixAwsError("no Nix store paths were resolved")
         return sorted(set(resolved))
 
-    def cache_push(self, targets: Iterable[str], *, closure: bool = False) -> None:
+    def cache_push(self, targets: Iterable[str]) -> None:
+        """Publish selected paths with the closure a valid binary cache requires.
+
+        A cache can register a path only after its references are valid in that
+        same cache. Starting from selected paths bounds the operation; recursive
+        ``nix copy`` adds missing dependencies in a safe order and skips paths
+        already present in the destination cache.
+        """
         self.require_operator_identity()
         config = self.provisioner_config()
         secret_arn = config.get("local_cache_signing_secret_arn")
@@ -402,10 +409,7 @@ class App:
                 f"&parallel-compression=true&write-nar-listing=true"
                 f"&secret-key={urllib.parse.quote(str(key_path), safe='/')}"
             )
-            command = ["nix", "copy", "-L"]
-            if not closure:
-                command.append("--no-recursive")
-            command.extend(["--to", store_url, *paths])
+            command = ["nix", "copy", "-L", "--to", store_url, *paths]
             status = self.run_logged(command, "cache-push")
             if status:
                 raise NixAwsError(f"nix copy failed with status {status}")
@@ -1153,11 +1157,13 @@ def parser() -> argparse.ArgumentParser:
 
     cache = commands.add_parser("cache")
     cache_commands = cache.add_subparsers(dest="cache_command", required=True)
-    push = cache_commands.add_parser("push")
+    push = cache_commands.add_parser(
+        "push", help="publish targets and the dependency closure required by the cache"
+    )
     push.add_argument(
         "--closure",
         action="store_true",
-        help="publish each target and its full dependency closure",
+        help="deprecated; cache push always includes the required dependency closure",
     )
     push.add_argument("targets", nargs="+")
 
@@ -1243,7 +1249,7 @@ def run(args: argparse.Namespace) -> int:
             raise NixAwsError("session exec requires a command after --")
         return app.session_exec(command)
     if args.command == "cache":
-        app.cache_push(args.targets, closure=args.closure)
+        app.cache_push(args.targets)
         return 0
     if args.command == "logs":
         if args.logs_command == "list":

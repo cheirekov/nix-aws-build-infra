@@ -14,6 +14,6 @@ read -r -a output_paths <<<"${OUT_PATHS}"
 printf '[post-build-hook] uploading outputs for %s\n' "${DRV_PATH:-unknown}" >&2
 if ! env -u NIX_CONFIG /nix/var/nix/profiles/default/bin/nix \
   --extra-experimental-features 'nix-command flakes' \
-  copy -L --no-recursive --to "${NIX_CACHE_STORE_URL}" "${output_paths[@]}"; then
+  copy -L --to "${NIX_CACHE_STORE_URL}" "${output_paths[@]}"; then
   printf '[post-build-hook] cache upload failed for %s\n' "${DRV_PATH:-unknown}" >&2
 fi

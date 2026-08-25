@@ -39,7 +39,7 @@ mapfile -t built_paths < <(sort -u "${NIX_AWS_BUILT_PATHS_FILE}")
 if ((${#built_paths[@]})); then
   printf '[build] retrying %d locally built output(s) to %s\n' \
     "${#built_paths[@]}" "${NIX_CACHE_BUCKET}"
-  nix copy -L --no-recursive --to "${NIX_CACHE_STORE_URL}" "${built_paths[@]}"
+  nix copy -L --to "${NIX_CACHE_STORE_URL}" "${built_paths[@]}"
   for output_path in "${built_paths[@]}"; do
     nix path-info --store "${NIX_CACHE_URL}" "${output_path}"
   done

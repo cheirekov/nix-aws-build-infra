@@ -228,17 +228,15 @@ def test_local_build_pushes_only_outputs_recorded_in_its_build_log(
         "locally_built_outputs",
         lambda _self: ["/nix/store/aaa-local-output", "/nix/store/bbb-local-output"],
     )
-    calls: list[tuple[object, ...]] = []
+    calls: list[list[str]] = []
     monkeypatch.setattr(
         App,
         "cache_push",
-        lambda _self, targets, *, closure=False: calls.append((list(targets), closure)),
+        lambda _self, targets: calls.append(list(targets)),
     )
 
     assert run(parser().parse_args(["build", "--push", ".#fixture"])) == 0
-    assert calls == [
-        (["/nix/store/aaa-local-output", "/nix/store/bbb-local-output"], False)
-    ]
+    assert calls == [["/nix/store/aaa-local-output", "/nix/store/bbb-local-output"]]
 
 
 def test_local_build_push_skips_a_fully_substituted_build(
@@ -292,14 +290,7 @@ not-json
     )
 
 
-def test_cache_push_defaults_to_exact_paths_and_accepts_closure_mode() -> None:
-    exact = parser().parse_args(["cache", "push", "./result"])
-    closure = parser().parse_args(["cache", "push", "--closure", "./result"])
-    assert exact.closure is False
-    assert closure.closure is True
-
-
-def test_cache_push_uses_no_recursive_unless_closure_is_requested(
+def test_cache_push_includes_the_closure_required_by_the_destination_cache(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
@@ -335,10 +326,16 @@ def test_cache_push_uses_no_recursive_unless_closure_is_requested(
     )
 
     app.cache_push(["./result"])
-    app.cache_push(["./result"], closure=True)
 
-    assert "--no-recursive" in commands[0]
-    assert "--no-recursive" not in commands[1]
+    assert len(commands) == 1
+    assert commands[0][:4] == ["nix", "copy", "-L", "--to"]
+    assert commands[0][-1] == "/nix/store/local-output"
+    assert "--no-recursive" not in commands[0]
+
+
+def test_cache_push_accepts_the_former_closure_flag_for_compatibility() -> None:
+    args = parser().parse_args(["cache", "push", "--closure", "./result"])
+    assert args.targets == ["./result"]
 
 
 def test_remote_and_push_are_mutually_exclusive(
