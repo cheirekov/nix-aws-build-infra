@@ -9,6 +9,8 @@ resource "aws_dynamodb_table" "build_lock" {
   }
 
   ttl {
+    # GLOBAL leases use lease_expires_at instead: native TTL cannot check EC2
+    # liveness. This attribute is only for session-history garbage collection.
     attribute_name = "expires_at"
     enabled        = true
   }

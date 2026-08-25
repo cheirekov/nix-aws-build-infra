@@ -58,7 +58,7 @@ resource "aws_iam_role_policy" "watchdog" {
       },
       {
         Effect   = "Allow"
-        Action   = ["dynamodb:DeleteItem"]
+        Action   = ["dynamodb:DeleteItem", "dynamodb:GetItem"]
         Resource = aws_dynamodb_table.build_lock.arn
       },
       {

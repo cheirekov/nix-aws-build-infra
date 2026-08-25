@@ -63,22 +63,25 @@ cleanup_partial() {
   elif [[ -n "${instance_id:-}" ]]; then
     aws ec2 terminate-instances --region "${aws_region}" --instance-ids "${instance_id}" >/dev/null 2>&1 || true
   fi
+  if [[ -n "${instance_id:-}" ]]; then
+    aws ec2 wait instance-terminated --region "${aws_region}" --instance-ids "${instance_id}" >/dev/null 2>&1 || true
+  fi
   if [[ -n "${launch_template_id:-}" ]]; then
     aws ec2 delete-launch-template --region "${aws_region}" --launch-template-id "${launch_template_id}" >/dev/null 2>&1 || true
   fi
   aws ssm delete-parameter --region "${aws_region}" --name "${parameter_name}" >/dev/null 2>&1 || true
-  if [[ -n "${lock_table:-}" ]]; then
-    aws dynamodb delete-item \
+  if [[ -n "${lock_table:-}" && -n "${lease_id:-}" ]]; then
+    python3 -m nix_aws.lease \
       --region "${aws_region}" \
-      --table-name "${lock_table}" \
-      --key '{"pk":{"S":"GLOBAL"}}' \
-      --condition-expression '#owner = :owner' \
-      --expression-attribute-names '{"#owner":"owner"}' \
-      --expression-attribute-values "{\":owner\":{\"S\":\"${lock_owner}\"}}" >/dev/null 2>&1 || true
+      --project "${project_name}" \
+      --table "${lock_table}" \
+      release \
+      --owner "${lock_owner}" \
+      --lease-id "${lease_id}" || true
   fi
   return "${status}"
 }
-trap cleanup_partial ERR
+trap cleanup_partial EXIT
 
 log "requesting one-hour registration token for ${github_repository}"
 registration_token="$(api \
@@ -93,13 +96,16 @@ provisioner_config="$(aws ssm get-parameter \
 lock_table="$(jq -er .build_lock_table <<<"${provisioner_config}")"
 lock_owner="gha-${run_key}"
 lock_expires_at="$(($(date +%s) + 43200))"
-aws dynamodb put-item \
+lease_id="$(python3 -m nix_aws.lease \
   --region "${aws_region}" \
-  --table-name "${lock_table}" \
-  --item "{\"pk\":{\"S\":\"GLOBAL\"},\"owner\":{\"S\":\"${lock_owner}\"},\"expires_at\":{\"N\":\"${lock_expires_at}\"},\"created_at\":{\"N\":\"$(date +%s)\"}}" \
-  --condition-expression 'attribute_not_exists(pk) OR expires_at < :now' \
-  --expression-attribute-values "{\":now\":{\"N\":\"$(date +%s)\"}}" >/dev/null
-printf 'lock_table=%s\nlock_owner=%s\n' "${lock_table}" "${lock_owner}" >>"${github_output}"
+  --project "${project_name}" \
+  --table "${lock_table}" \
+  acquire \
+  --owner "${lock_owner}" \
+  --owner-kind github \
+  --expires-at "${lock_expires_at}")"
+printf 'lock_table=%s\nlock_owner=%s\nlease_id=%s\n' \
+  "${lock_table}" "${lock_owner}" "${lease_id}" >>"${github_output}"
 
 ami_id="$(aws ssm get-parameter \
   --region "${aws_region}" \
@@ -196,10 +202,28 @@ fleet_config="$(jq -cn \
     TagSpecifications:[{ResourceType:"fleet",Tags:[{Key:"ManagedBy",Value:$project_name},{Key:"Project",Value:$project_name},{Key:"GitHubRunId",Value:$run_key}]}]
   }')"
 
+python3 -m nix_aws.lease \
+  --region "${aws_region}" \
+  --project "${project_name}" \
+  --table "${lock_table}" \
+  touch \
+  --owner "${lock_owner}" \
+  --lease-id "${lease_id}" \
+  --phase launching
 fleet_output="$(aws ec2 create-fleet --region "${aws_region}" --cli-input-json "${fleet_config}")"
 fleet_id="$(jq -er .FleetId <<<"${fleet_output}")"
 instance_id="$(jq -er '.Instances[0].InstanceIds[0]' <<<"${fleet_output}")"
 printf 'fleet_id=%s\ninstance_id=%s\n' "${fleet_id}" "${instance_id}" >>"${github_output}"
+python3 -m nix_aws.lease \
+  --region "${aws_region}" \
+  --project "${project_name}" \
+  --table "${lock_table}" \
+  touch \
+  --owner "${lock_owner}" \
+  --lease-id "${lease_id}" \
+  --phase active \
+  --fleet-id "${fleet_id}" \
+  --instance-id "${instance_id}"
 
 log "waiting for ${instance_id}"
 aws ec2 wait instance-running --region "${aws_region}" --instance-ids "${instance_id}"
@@ -212,7 +236,7 @@ while ((SECONDS < deadline)); do
     runs_on="$(jq -cn --arg arch "${github_arch}" --arg label "${runner_label}" '["self-hosted","linux",$arch,$label]')"
     printf 'runner_name=%s\nrunner_label=%s\nruns_on=%s\nssm_parameter=%s\n' \
       "${runner_name}" "${runner_label}" "${runs_on}" "${parameter_name}" >>"${github_output}"
-    trap - ERR
+    trap - EXIT
     log "runner ${runner_name} is online"
     exit 0
   fi

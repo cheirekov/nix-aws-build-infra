@@ -8,7 +8,7 @@ import subprocess
 
 import pytest
 
-from nix_aws.cli import PROFILES, App, NixAwsError, SessionState, parser, run
+from nix_aws.cli import PROFILES, App, NixAwsError, SessionState, SignalExit, parser, run
 
 
 def test_all_profiles_have_twelve_capacity_pools() -> None:
@@ -391,3 +391,58 @@ def test_remote_build_uses_one_shot_session_and_always_stops(
         ("exec", (), ".#fixture", []),
         ("stop", True),
     ]
+
+
+def test_remote_build_stops_when_signal_interrupts_execution(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    calls: list[str] = []
+    monkeypatch.setattr(App, "session_start", lambda *_args: calls.append("start"))
+
+    def interrupted(*_args: object, **_kwargs: object) -> int:
+        calls.append("exec")
+        raise SignalExit(2)
+
+    monkeypatch.setattr(App, "session_exec", interrupted)
+    monkeypatch.setattr(
+        App, "session_stop", lambda _self, *, quiet=False: calls.append(f"stop:{quiet}")
+    )
+    args = parser().parse_args(["build", "--remote", ".#fixture"])
+
+    with pytest.raises(SignalExit):
+        run(args)
+    assert calls == ["start", "exec", "stop:True"]
+
+
+def test_session_start_cleans_provisional_state_on_signal(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    app = App(argparse.Namespace())
+    monkeypatch.setattr(app, "require_operator_identity", dict)
+    monkeypatch.setattr(
+        app,
+        "provisioner_config",
+        lambda: {"build_lock_table": "locks"},
+    )
+    monkeypatch.setattr(app, "budget_preflight", lambda *_args: 0.5)
+    monkeypatch.setattr(app, "lock_acquire", lambda *_args: "lease-new")
+    monkeypatch.setattr(
+        "nix_aws.cli.subprocess.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SignalExit(15)),
+    )
+    cleaned: list[SessionState] = []
+    monkeypatch.setattr(
+        app,
+        "stop_state",
+        lambda state, *, quiet=False: cleaned.append(state),
+    )
+
+    with pytest.raises(SignalExit):
+        app.session_start("x86_64-linux", "standard", False)
+    assert cleaned[0].lease_id == "lease-new"
+    assert cleaned[0].instance_id == ""
+    assert app.state_file.exists()

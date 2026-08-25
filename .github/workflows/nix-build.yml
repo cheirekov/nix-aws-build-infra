@@ -64,6 +64,7 @@ jobs:
       ssm_parameter: ${{ steps.provision.outputs.ssm_parameter }}
       lock_table: ${{ steps.provision.outputs.lock_table }}
       lock_owner: ${{ steps.provision.outputs.lock_owner }}
+      lease_id: ${{ steps.provision.outputs.lease_id }}
     steps:
       - name: Check out infrastructure scripts
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
@@ -165,5 +166,6 @@ jobs:
           SSM_PARAMETER: ${{ needs.provision.outputs.ssm_parameter }}
           LOCK_TABLE: ${{ needs.provision.outputs.lock_table }}
           LOCK_OWNER: ${{ needs.provision.outputs.lock_owner }}
+          LEASE_ID: ${{ needs.provision.outputs.lease_id }}
           PROJECT_NAME: ${{ inputs.project_name }}
         run: ./scripts/cleanup-runner.sh

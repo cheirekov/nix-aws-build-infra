@@ -2,6 +2,7 @@
 set -euo pipefail
 
 aws_region="${AWS_REGION:-eu-central-1}"
+project_name="${PROJECT_NAME:-nix-aws-build-infra}"
 github_repository="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 github_token="${GITHUB_APP_TOKEN:?GITHUB_APP_TOKEN is required}"
 fleet_id="${FLEET_ID:-}"
@@ -11,6 +12,7 @@ runner_name="${RUNNER_NAME:-}"
 ssm_parameter="${SSM_PARAMETER:-}"
 lock_table="${LOCK_TABLE:-}"
 lock_owner="${LOCK_OWNER:-}"
+lease_id="${LEASE_ID:-}"
 
 if [[ -n "${fleet_id}" ]]; then
   aws ec2 delete-fleets \
@@ -28,14 +30,25 @@ fi
 if [[ -n "${ssm_parameter}" ]]; then
   aws ssm delete-parameter --region "${aws_region}" --name "${ssm_parameter}" >/dev/null 2>&1 || true
 fi
-if [[ -n "${lock_table}" && -n "${lock_owner}" ]]; then
-  aws dynamodb delete-item \
-    --region "${aws_region}" \
-    --table-name "${lock_table}" \
-    --key '{"pk":{"S":"GLOBAL"}}' \
-    --condition-expression '#owner = :owner' \
-    --expression-attribute-names '{"#owner":"owner"}' \
-    --expression-attribute-values "{\":owner\":{\"S\":\"${lock_owner}\"}}" >/dev/null 2>&1 || true
+if [[ -n "${lock_table}" && -n "${lock_owner}" && -n "${lease_id}" ]]; then
+  lease_released=false
+  for _attempt in {1..12}; do
+    if python3 -m nix_aws.lease \
+      --region "${aws_region}" \
+      --project "${project_name}" \
+      --table "${lock_table}" \
+      release \
+      --owner "${lock_owner}" \
+      --lease-id "${lease_id}"; then
+      lease_released=true
+      break
+    fi
+    sleep 5
+  done
+  if [[ "${lease_released}" != true ]]; then
+    printf 'Lease %s was retained because EC2 termination could not be proven.\n' "${lock_owner}" >&2
+    exit 1
+  fi
 fi
 
 if [[ -n "${runner_name}" ]]; then

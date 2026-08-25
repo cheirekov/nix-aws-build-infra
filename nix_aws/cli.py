@@ -17,9 +17,11 @@ import sys
 import time
 import urllib.parse
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
+
+from .lease import LeaseError, LeaseManager, LeaseRecord
 
 DEFAULT_REGION = "eu-central-1"
 DEFAULT_PROJECT = "nix-aws-build-infra"
@@ -103,10 +105,30 @@ class SessionState:
     host_key: str
     lock_table: str
     estimated_hourly_cost: float
+    lease_id: str = ""
 
 
 class NixAwsError(RuntimeError):
     pass
+
+
+class SignalExit(BaseException):
+    def __init__(self, signum: int):
+        self.signum = signum
+        super().__init__(signal.Signals(signum).name)
+
+
+@contextlib.contextmanager
+def ignore_termination_signals() -> Iterable[None]:
+    previous = {
+        signum: signal.signal(signum, signal.SIG_IGN)
+        for signum in (signal.SIGINT, signal.SIGTERM)
+    }
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 class App:
@@ -133,6 +155,9 @@ class App:
             directory.chmod(mode)
         self.state_file = self.runtime_dir / "session.json"
         self.last_build_log: pathlib.Path | None = None
+
+    def lease_manager(self) -> LeaseManager:
+        return LeaseManager(self.aws, self.project)
 
     def aws(
         self,
@@ -417,48 +442,26 @@ class App:
         with contextlib.suppress(FileNotFoundError):
             self.state_file.unlink()
 
-    def lock_acquire(self, table: str, session_id: str, expires_at: int) -> None:
-        now = int(time.time())
-        item = {
-            "pk": {"S": "GLOBAL"},
-            "owner": {"S": session_id},
-            "expires_at": {"N": str(expires_at)},
-            "created_at": {"N": str(now)},
-        }
-        values = {":now": {"N": str(now)}}
+    def lock_acquire(self, table: str, session_id: str, expires_at: int) -> str:
         try:
-            self.aws(
-                "dynamodb",
-                "put-item",
-                "--table-name",
-                table,
-                "--item",
-                json.dumps(item, separators=(",", ":")),
-                "--condition-expression",
-                "attribute_not_exists(pk) OR expires_at < :now",
-                "--expression-attribute-values",
-                json.dumps(values, separators=(",", ":")),
+            acquired = self.lease_manager().acquire(table, session_id, "local", expires_at)
+        except LeaseError as exc:
+            raise NixAwsError(str(exc)) from exc
+        if acquired.recovered is not None:
+            previous = acquired.recovered
+            assert previous.lease is not None
+            print(
+                f"[nix-aws] recovered {previous.state} global lease from "
+                f"{previous.lease.owner} after confirming no active EC2 instance or fleet",
+                file=sys.stderr,
             )
-        except subprocess.CalledProcessError as exc:
-            raise NixAwsError("another GitHub or local AWS builder holds the global lease") from exc
+        return acquired.lease.lease_id
 
-    def lock_release(self, table: str, session_id: str) -> None:
-        values = {":owner": {"S": session_id}}
-        self.aws(
-            "dynamodb",
-            "delete-item",
-            "--table-name",
-            table,
-            "--key",
-            json.dumps({"pk": {"S": "GLOBAL"}}),
-            "--condition-expression",
-            "#owner = :owner",
-            "--expression-attribute-names",
-            json.dumps({"#owner": "owner"}),
-            "--expression-attribute-values",
-            json.dumps(values),
-            check=False,
-        )
+    def lock_release(self, table: str, session_id: str, lease_id: str) -> bool:
+        try:
+            return self.lease_manager().release_owned(table, session_id, lease_id)
+        except LeaseError as exc:
+            raise NixAwsError(str(exc)) from exc
 
     def put_session_history(self, state: SessionState, ended_at: int) -> None:
         duration_hours = max(
@@ -565,7 +568,12 @@ class App:
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
 
-    def create_spot_fleet(self, fleet_config: dict[str, Any]) -> tuple[str, str]:
+    def create_spot_fleet(
+        self,
+        fleet_config: dict[str, Any],
+        *,
+        before_attempt: Callable[[], None] | None = None,
+    ) -> tuple[str, str]:
         """Launch one instance, excluding capacity-starved pools between attempts.
 
         An instant EC2 Fleet evaluates every supplied override, but makes only one
@@ -576,6 +584,8 @@ class App:
         remaining = list(fleet_config["LaunchTemplateConfigs"][0]["Overrides"])
         capacity_failures: list[str] = []
         while remaining:
+            if before_attempt is not None:
+                before_attempt()
             request = json.loads(json.dumps(fleet_config))
             request["LaunchTemplateConfigs"][0]["Overrides"] = remaining
             fleet = self.aws_json(
@@ -652,20 +662,45 @@ class App:
             existing = self.state_load()
             if self.session_alive(existing):
                 raise NixAwsError(f"session {existing.session_id} is already active")
-            self.state_remove()
+            print(
+                f"[nix-aws] recovering interrupted local session {existing.session_id}",
+                file=sys.stderr,
+            )
+            self.session_stop(quiet=True)
         config = self.provisioner_config()
         lock_table = str(config["build_lock_table"])
         profile = PROFILES[(system, profile_name)]
         hourly = self.budget_preflight(lock_table, system, profile_name, allow_budget_override)
         session_id = uuid.uuid4().hex
         expires_at = int(time.time()) + profile.ttl_hours * 3600
-        self.lock_acquire(lock_table, session_id, expires_at + 900)
-        key_path = self.runtime_dir / f"id_ed25519-{session_id}"
-        parameter_name = f"/{self.project}/sessions/{session_id}/config"
-        ready_parameter_name = f"/{self.project}/sessions/{session_id}/ready"
-        fleet_id = instance_id = launch_template_id = ""
+        lease_id = ""
+        state: SessionState | None = None
         tunnel: subprocess.Popen[Any] | None = None
         try:
+            lease_id = self.lock_acquire(lock_table, session_id, expires_at + 900)
+            key_path = self.runtime_dir / f"id_ed25519-{session_id}"
+            parameter_name = f"/{self.project}/sessions/{session_id}/config"
+            ready_parameter_name = f"/{self.project}/sessions/{session_id}/ready"
+            state = SessionState(
+                session_id=session_id,
+                system=system,
+                profile=profile_name,
+                started_at=dt.datetime.now(dt.UTC).isoformat(),
+                expires_at=expires_at,
+                instance_id="",
+                fleet_id="",
+                launch_template_id="",
+                parameter_name=parameter_name,
+                ready_parameter_name=ready_parameter_name,
+                tunnel_pid=0,
+                local_port=0,
+                ssh_key=str(key_path),
+                host_key="",
+                lock_table=lock_table,
+                estimated_hourly_cost=hourly,
+                lease_id=lease_id,
+            )
+            self.state_save(state)
             subprocess.run(
                 ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key_path)],
                 check=True,
@@ -752,7 +787,8 @@ class App:
                 "--launch-template-data",
                 json.dumps(launch_data, separators=(",", ":")),
             )
-            launch_template_id = template["LaunchTemplate"]["LaunchTemplateId"]
+            state.launch_template_id = template["LaunchTemplate"]["LaunchTemplateId"]
+            self.state_save(state)
             overrides = [
                 {"SubnetId": subnet, "InstanceType": instance_type}
                 for subnet in config["runner_subnet_ids"]
@@ -771,7 +807,7 @@ class App:
                 "LaunchTemplateConfigs": [
                     {
                         "LaunchTemplateSpecification": {
-                            "LaunchTemplateId": launch_template_id,
+                            "LaunchTemplateId": state.launch_template_id,
                             "Version": "$Latest",
                         },
                         "Overrides": overrides,
@@ -788,8 +824,22 @@ class App:
                     }
                 ],
             }
-            fleet_id, instance_id = self.create_spot_fleet(fleet_config)
-            self.aws("ec2", "wait", "instance-running", "--instance-ids", instance_id)
+            state.fleet_id, state.instance_id = self.create_spot_fleet(
+                fleet_config,
+                before_attempt=lambda: self.lease_manager().touch(
+                    lock_table, session_id, lease_id, "launching"
+                ),
+            )
+            self.state_save(state)
+            self.lease_manager().touch(
+                lock_table,
+                session_id,
+                lease_id,
+                "active",
+                instance_id=state.instance_id,
+                fleet_id=state.fleet_id,
+            )
+            self.aws("ec2", "wait", "instance-running", "--instance-ids", state.instance_id)
             deadline = time.monotonic() + 900
             ready: dict[str, Any] | None = None
             while time.monotonic() < deadline:
@@ -829,7 +879,7 @@ class App:
                     "--region",
                     self.region,
                     "--target",
-                    instance_id,
+                    state.instance_id,
                     "--document-name",
                     "AWS-StartPortForwardingSession",
                     "--parameters",
@@ -850,47 +900,43 @@ class App:
                     time.sleep(1)
             else:
                 raise NixAwsError(f"SSM tunnel did not open; inspect {tunnel_log}")
-            state = SessionState(
-                session_id=session_id,
-                system=system,
-                profile=profile_name,
-                started_at=dt.datetime.now(dt.UTC).isoformat(),
-                expires_at=expires_at,
-                instance_id=instance_id,
-                fleet_id=fleet_id,
-                launch_template_id=launch_template_id,
-                parameter_name=parameter_name,
-                ready_parameter_name=ready_parameter_name,
-                tunnel_pid=tunnel.pid,
-                local_port=local_port,
-                ssh_key=str(key_path),
-                host_key=str(ready["host_key"]),
-                lock_table=lock_table,
-                estimated_hourly_cost=hourly,
-            )
+            state.tunnel_pid = tunnel.pid
+            state.local_port = local_port
+            state.host_key = str(ready["host_key"])
             self.state_save(state)
             print(
-                f"[nix-aws] session {session_id} ready on {instance_id}; "
+                f"[nix-aws] session {session_id} ready on {state.instance_id}; "
                 f"{system}/{profile_name}, expires "
                 f"{dt.datetime.fromtimestamp(expires_at, tz=dt.UTC).isoformat()}"
             )
             return state
-        except Exception:
+        except BaseException:
             if tunnel is not None and tunnel.poll() is None:
                 tunnel.terminate()
-            self.cleanup_aws_resources(
-                fleet_id=fleet_id,
-                instance_id=instance_id,
-                launch_template_id=launch_template_id,
-                parameters=(parameter_name, ready_parameter_name),
-            )
-            self.lock_release(lock_table, session_id)
-            for path in (key_path, key_path.with_suffix(".pub")):
-                with contextlib.suppress(FileNotFoundError):
-                    path.unlink()
+            try:
+                if state is not None:
+                    self.stop_state(state, quiet=True)
+                else:
+                    current = self.lease_manager().get(lock_table)
+                    if current is not None and current.owner == session_id:
+                        self.lock_release(lock_table, session_id, lease_id)
+            except (
+                LeaseError,
+                NixAwsError,
+                OSError,
+                subprocess.CalledProcessError,
+                ValueError,
+            ) as cleanup_exc:
+                print(
+                    f"[nix-aws] interrupted-session cleanup incomplete: {cleanup_exc}; "
+                    "the lease was retained if any EC2 resource could still be active",
+                    file=sys.stderr,
+                )
             raise
 
     def session_alive(self, state: SessionState) -> bool:
+        if state.tunnel_pid <= 0:
+            return False
         try:
             os.kill(state.tunnel_pid, 0)
             return state.expires_at > int(time.time())
@@ -960,26 +1006,121 @@ class App:
             if parameter:
                 self.aws("ssm", "delete-parameter", "--name", parameter, check=False)
 
+    def wait_for_lease_resources_inactive(
+        self,
+        state: SessionState,
+        *,
+        timeout_seconds: int = 300,
+    ) -> None:
+        if state.instance_id:
+            self.aws(
+                "ec2",
+                "wait",
+                "instance-terminated",
+                "--instance-ids",
+                state.instance_id,
+                check=False,
+            )
+        deadline = time.monotonic() + timeout_seconds
+        owner = LeaseRecord(
+            owner=state.session_id,
+            owner_kind="local",
+            expires_at=state.expires_at,
+            created_at=0,
+        )
+        while True:
+            try:
+                resources = self.lease_manager().resources(owner)
+            except (LeaseError, subprocess.CalledProcessError) as exc:
+                raise NixAwsError(
+                    f"could not verify EC2 resources for lease owner {state.session_id}: {exc}"
+                ) from exc
+            if not resources.active:
+                return
+            if time.monotonic() >= deadline:
+                details = json.dumps(
+                    {
+                        "instances": list(resources.instances),
+                        "fleets": list(resources.fleets),
+                    },
+                    separators=(",", ":"),
+                )
+                raise NixAwsError(
+                    f"EC2 resources for {state.session_id} remain active after termination: {details}; "
+                    "the global lease was retained"
+                )
+            time.sleep(5)
+
+    def terminate_owner_tagged_resources(self, state: SessionState) -> None:
+        try:
+            resources = self.lease_manager().resources(
+                LeaseRecord(
+                    owner=state.session_id,
+                    owner_kind="local",
+                    expires_at=state.expires_at,
+                    created_at=0,
+                )
+            )
+        except (LeaseError, subprocess.CalledProcessError) as exc:
+            raise NixAwsError(
+                f"could not inspect resources owned by {state.session_id}; retaining the lease"
+            ) from exc
+        for fleet in resources.fleets:
+            self.aws(
+                "ec2",
+                "delete-fleets",
+                "--fleet-ids",
+                fleet["fleet_id"],
+                "--terminate-instances",
+                check=False,
+            )
+        for instance in resources.instances:
+            self.aws(
+                "ec2",
+                "terminate-instances",
+                "--instance-ids",
+                instance["instance_id"],
+                check=False,
+            )
+
+    def stop_state(self, state: SessionState, *, quiet: bool = False) -> None:
+        with ignore_termination_signals():
+            with contextlib.suppress(ProcessLookupError):
+                if state.tunnel_pid > 0:
+                    os.killpg(state.tunnel_pid, signal.SIGTERM)
+            self.terminate_owner_tagged_resources(state)
+            self.cleanup_aws_resources(
+                fleet_id=state.fleet_id,
+                instance_id=state.instance_id,
+                launch_template_id=state.launch_template_id,
+                parameters=(state.parameter_name, state.ready_parameter_name),
+            )
+            self.wait_for_lease_resources_inactive(state)
+            if state.launch_template_id:
+                self.aws(
+                    "ec2",
+                    "delete-launch-template",
+                    "--launch-template-id",
+                    state.launch_template_id,
+                    check=False,
+                )
+            ended_at = int(time.time())
+            self.put_session_history(state, ended_at)
+            self.lock_release(state.lock_table, state.session_id, state.lease_id)
+            for path in (
+                pathlib.Path(state.ssh_key),
+                pathlib.Path(state.ssh_key).with_suffix(".pub"),
+            ):
+                with contextlib.suppress(FileNotFoundError):
+                    path.unlink()
+            self.state_remove()
+        if not quiet:
+            print(f"[nix-aws] stopped session {state.session_id}")
+
     def session_stop(self, *, quiet: bool = False) -> None:
         self.require_operator_identity()
         state = self.state_load()
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(state.tunnel_pid, signal.SIGTERM)
-        self.cleanup_aws_resources(
-            fleet_id=state.fleet_id,
-            instance_id=state.instance_id,
-            launch_template_id=state.launch_template_id,
-            parameters=(state.parameter_name, state.ready_parameter_name),
-        )
-        ended_at = int(time.time())
-        self.put_session_history(state, ended_at)
-        self.lock_release(state.lock_table, state.session_id)
-        for path in (pathlib.Path(state.ssh_key), pathlib.Path(state.ssh_key).with_suffix(".pub")):
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
-        self.state_remove()
-        if not quiet:
-            print(f"[nix-aws] stopped session {state.session_id}")
+        self.stop_state(state, quiet=quiet)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1036,6 +1177,16 @@ def parser() -> argparse.ArgumentParser:
     )
     estimate.add_argument("--profile", choices=("standard", "large"), default="standard")
     cost_commands.add_parser("status")
+
+    lease = commands.add_parser("lease", help="inspect or safely recover the global build lease")
+    lease_commands = lease.add_subparsers(dest="lease_command", required=True)
+    lease_commands.add_parser("status")
+    release = lease_commands.add_parser("release")
+    release.add_argument(
+        "--force",
+        action="store_true",
+        help="release only after DynamoDB and EC2 prove the lease is recoverable",
+    )
     return root
 
 
@@ -1136,6 +1287,29 @@ def run(args: argparse.Namespace) -> int:
             )
         )
         return 0
+    if args.command == "lease":
+        app.require_operator_identity()
+        table = str(app.provisioner_config()["build_lock_table"])
+        manager = app.lease_manager()
+        if args.lease_command == "status":
+            print(json.dumps(manager.inspect(table).as_dict(), indent=2))
+            return 0
+        if not args.force:
+            raise NixAwsError(
+                "lease release requires --force; it still refuses active or recently provisioning owners"
+            )
+        try:
+            previous = manager.force_release(table)
+        except LeaseError as exc:
+            raise NixAwsError(str(exc)) from exc
+        if previous.lease is None:
+            print("[nix-aws] global lease is already free")
+        else:
+            print(
+                f"[nix-aws] released {previous.state} lease owned by "
+                f"{previous.lease.owner} after confirming no active EC2 instance or fleet"
+            )
+        return 0
     raise NixAwsError("unknown command")
 
 
@@ -1145,11 +1319,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "build" and shutil.which(required) is None:
             print(f"nix-aws: required executable not found: {required}", file=sys.stderr)
             return 127
+    previous_handlers = {
+        signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
+    }
+
+    def terminate(signum: int, _frame: Any) -> None:
+        raise SignalExit(signum)
+
+    for signum in previous_handlers:
+        signal.signal(signum, terminate)
     try:
         return run(args)
-    except (NixAwsError, subprocess.CalledProcessError, KeyError, ValueError) as exc:
+    except SignalExit as exc:
+        print(
+            f"nix-aws: received {signal.Signals(exc.signum).name}; cleanup completed or the "
+            "lease was retained for safety",
+            file=sys.stderr,
+        )
+        return 128 + exc.signum
+    except (LeaseError, NixAwsError, subprocess.CalledProcessError, KeyError, ValueError) as exc:
         print(f"nix-aws: {exc}", file=sys.stderr)
         return 1
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 if __name__ == "__main__":

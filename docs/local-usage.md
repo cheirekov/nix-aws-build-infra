@@ -61,6 +61,52 @@ The connection uses an SSM port-forward to SSH with an ephemeral key and a
 pinned per-instance host key. No EC2 inbound port is opened. Only one local or
 GitHub builder can hold the global lease.
 
+## Interrupted build and lease recovery
+
+`nix-aws` handles normal exit, `SIGINT`, and `SIGTERM` by terminating the owned
+Fleet/instance and retaining the lease until EC2 proves that no owner-tagged
+instance or Fleet is active. A one-shot command interrupted during provisioning
+also persists enough provisional state to run the same cleanup. `SIGKILL`, host
+loss, or an AWS outage can still leave an owner record for later recovery.
+
+Inspect both the strongly consistent DynamoDB record and its matching EC2
+resources before taking operator action:
+
+```console
+nix-aws lease status
+```
+
+The reported states are:
+
+- `free`: no global lease exists;
+- `unleased-active`: a project-tagged EC2 builder exists without a lease, so a
+  second builder is blocked pending cleanup;
+- `active`: a matching EC2 instance or Fleet exists, even if the lease timestamp
+  has expired; this lease is never recovered or released;
+- `provisioning`: there is no resource yet, but the owner was created or
+  heartbeated within the five-minute launch grace period;
+- `expired`: the timestamp has passed and no matching EC2 resource exists;
+- `orphaned`: the unexpired owner has neither a matching EC2 resource nor a
+  recent heartbeat.
+
+A new local or GitHub build automatically replaces only `expired` or `orphaned`
+records. Replacement is conditional on the exact DynamoDB lease version, so a
+concurrent owner or heartbeat wins without being overwritten. To remove a
+verified recoverable record without starting a build, run:
+
+```console
+nix-aws lease release --force
+```
+
+`--force` does not bypass the safety checks: the command refuses `active`,
+`unleased-active`, `provisioning`, malformed, or concurrently changed leases. If status cannot
+query DynamoDB or EC2, do not edit the table manually. Restore AWS/SSO access,
+run status again, and either stop the matching local session with `nix-aws
+session stop` or wait for the tagged EC2 resources to terminate. The watchdog
+performs the same EC2 check before deleting an expired record. DynamoDB native
+TTL is deliberately limited to session-history garbage collection; operational
+lease expiry is never an unconditional TTL deletion.
+
 ## Monitoring and cost
 
 ```console

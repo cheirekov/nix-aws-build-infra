@@ -125,10 +125,14 @@ remains private; CloudFront OAC receives only `GET`/`HEAD`. The local operator
 cannot retrieve the CI signing key, delete cache objects, or administer IAM.
 The GitHub runner and local remote-builder roles have separate signing secrets.
 
-Cleanup removes the fleet, instance, launch template, one-time parameter and
-lease even when a build fails. EventBridge/Lambda cleans tagged orphaned
-resources older than 12 hours. CloudWatch logs are retained for 14 days and
-local CLI logs for 30 days.
+Cleanup removes the fleet, instance, launch template and one-time parameter even
+when a build fails, then releases the versioned lease only after owner-tagged
+EC2 resources are inactive. `SIGINT`/`SIGTERM`, expired/orphaned recovery and
+operator inspection use the same conditional lease checks. EventBridge/Lambda
+cleans tagged orphaned resources older than 12 hours and never deletes an
+expired lease while its builder resources remain active. CloudWatch logs are
+retained for 14 days and local CLI logs for 30 days. See the recovery procedure
+in [Local usage](docs/local-usage.md#interrupted-build-and-lease-recovery).
 
 ## Cost controls
 
