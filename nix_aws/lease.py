@@ -110,8 +110,14 @@ class LeaseManager:
 
     def _json(self, *arguments: str) -> dict[str, Any]:
         result = self.aws(*arguments, "--output", "json")
+        raw = result.stdout.strip()
+        # AWS CLI emits an empty successful response when DynamoDB get-item
+        # finds no Item. Treat that documented absence as an empty object;
+        # every other JSON call must still return an object.
+        if not raw and arguments[:2] == ("dynamodb", "get-item"):
+            return {}
         try:
-            payload = json.loads(result.stdout)
+            payload = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise LeaseError(f"AWS returned invalid JSON for {' '.join(arguments[:2])}") from exc
         if not isinstance(payload, dict):

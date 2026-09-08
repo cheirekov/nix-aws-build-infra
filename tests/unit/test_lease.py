@@ -37,10 +37,12 @@ class FakeAws:
         *,
         instance_state: str | None = None,
         fleet_state: str | None = None,
+        empty_get_item: bool = False,
     ):
         self.item = item
         self.instance_state = instance_state
         self.fleet_state = fleet_state
+        self.empty_get_item = empty_get_item
         self.calls: list[tuple[str, ...]] = []
         self.concurrent_item: dict[str, Any] | None = None
 
@@ -52,6 +54,8 @@ class FakeAws:
         self.calls.append(arguments)
         operation = arguments[:2]
         if operation == ("dynamodb", "get-item"):
+            if self.empty_get_item:
+                return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
             return self.completed(arguments, {"Item": self.item} if self.item else {})
         if operation == ("ec2", "describe-instances"):
             instances = []
@@ -115,6 +119,15 @@ def test_unleased_active_builder_blocks_acquisition() -> None:
     with pytest.raises(LeaseError, match="active EC2 builder resources without a global lease"):
         manager(fake).acquire("locks", "new-owner", "local", 2_000)
     assert not any(call[:2] == ("dynamodb", "put-item") for call in fake.calls)
+
+
+def test_empty_successful_get_item_response_means_no_lease() -> None:
+    fake = FakeAws(None, empty_get_item=True)
+
+    status = manager(fake).inspect("locks")
+
+    assert status.state == "free"
+    assert status.lease is None
 
 
 def test_expired_inactive_lease_is_conditionally_recovered() -> None:
